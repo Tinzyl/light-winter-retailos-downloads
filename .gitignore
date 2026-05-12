@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.db
+
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+**/flutter/ephemeral/
+**/android/.gradle/
+**/ios/Pods/
+**/macos/Pods/
+
+# IDE/system
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+~$*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Local generated state, logs, and private notes
+*.log
+*-state*.json
+android-phone-state*.json
+sunmi-*.json
+sunmi-cached-stock*.csv
+PasswordsOrSettings.md
+Run SUNMI Hot Reload.lnk
+
+# Release/build artifacts
+*.apk
+*.aab
+*.ipa
+*.msix
+*.zip
+dist/
+deploy/download-site/downloads/

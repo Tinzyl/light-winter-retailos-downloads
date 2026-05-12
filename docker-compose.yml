@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: light_winter_retail
+      POSTGRES_USER: lightwinter
+      POSTGRES_PASSWORD: lightwinter_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://lightwinter:lightwinter_dev@postgres:5432/light_winter_retail
+      APP_ENV: development
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres-data:

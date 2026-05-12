@@ -1,0 +1,15 @@
+[build]
+  publish = "deploy/download-site"
+
+[[headers]]
+  for = "/downloads/*.apk"
+  [headers.values]
+    Content-Type = "application/vnd.android.package-archive"
+    Content-Disposition = "attachment"
+
+[[headers]]
+  for = "/downloads/*.zip"
+  [headers.values]
+    Content-Type = "application/zip"
+    Content-Disposition = "attachment"
+
