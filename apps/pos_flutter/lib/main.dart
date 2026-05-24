@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -46,19 +47,29 @@ class _LightWinterPosAppState extends State<LightWinterPosApp>
   bool loaded = false;
   Timer? licenseTimer;
   Timer? syncTimer;
+  String _lastLicenseTickerLabel = '';
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    store.load().then((_) => setState(() => loaded = true));
+    store.load().then((_) {
+      if (!mounted) return;
+      setState(() => loaded = true);
+      store.refreshStartupCloudInBackground();
+    });
     licenseTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted && loaded && store.licenseExpiresAt != null) {
-        store.notifyListeners();
+        final nextLabel = store.licenseCountdownLabel;
+        if (nextLabel != _lastLicenseTickerLabel) {
+          _lastLicenseTickerLabel = nextLabel;
+          store.notifyListeners();
+        }
       }
     });
-    final syncInterval =
-        Platform.isWindows ? const Duration(minutes: 2) : const Duration(seconds: 45);
+    final syncInterval = Platform.isWindows
+        ? const Duration(minutes: 30)
+        : const Duration(minutes: 15);
     syncTimer = Timer.periodic(syncInterval, (_) {
       if (mounted && loaded) store.syncSilently();
     });
@@ -75,6 +86,9 @@ class _LightWinterPosAppState extends State<LightWinterPosApp>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (!loaded) return;
+    if (Platform.isWindows) {
+      return;
+    }
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.hidden) {
@@ -91,6 +105,11 @@ class _LightWinterPosAppState extends State<LightWinterPosApp>
     return MaterialApp(
       title: 'Light Winter RetailOS',
       debugShowCheckedModeBanner: false,
+      builder: (context, child) => AnimatedBuilder(
+        animation: store,
+        builder: (context, _) =>
+            BusyOverlay(store: store, child: child ?? const SizedBox.shrink()),
+      ),
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: seed),
         scaffoldBackgroundColor: const Color(0xFFF6F7F4),
@@ -106,17 +125,13 @@ class _LightWinterPosAppState extends State<LightWinterPosApp>
           : AnimatedBuilder(
               animation: store,
               builder: (context, _) {
-                Widget screen;
                 if (!store.isProvisioned) {
-                  screen = StartScreen(store: store);
-                  return BusyOverlay(store: store, child: screen);
+                  return StartScreen(store: store);
                 }
                 if (store.currentUser == null) {
-                  screen = LoginScreen(store: store);
-                  return BusyOverlay(store: store, child: screen);
+                  return LoginScreen(store: store);
                 }
-                screen = RetailShell(store: store);
-                return BusyOverlay(store: store, child: screen);
+                return RetailShell(store: store);
               },
             ),
     );
@@ -146,6 +161,8 @@ class AppStore extends ChangeNotifier {
   Set<String> branchStockInitialized = {};
   List<StockTransferRecord> stockTransfers = [];
   List<SaleVoidRecord> saleVoids = [];
+  List<AccountingEntry> accountingEntries = [];
+  Set<String> pendingSaleSyncIds = {};
   List<Supplier> suppliers = [];
   List<Customer> customers = [];
   List<CartItem> cart = [];
@@ -155,6 +172,7 @@ class AppStore extends ChangeNotifier {
   int nextCustomerNumber = 2;
   List<SaleRecord> sales = [];
   String displayCurrency = 'USD';
+  String posCurrency = 'USD';
   bool allCatalogueProductsVisible = false;
   Map<String, double> exchangeRates = {
     'USD': 1,
@@ -168,6 +186,7 @@ class AppStore extends ChangeNotifier {
   int fiscalDayNo = 0;
   bool fiscalDayOpen = false;
   DateTime? fiscalDayOpenedAt;
+  bool _manualSyncInProgress = false;
   String licenseLabel = 'Not licensed';
   DateTime? licenseExpiresAt;
   DateTime? trustedServerNowAtSync;
@@ -176,6 +195,7 @@ class AppStore extends ChangeNotifier {
   String deviceLockMessage = '';
   String lastLoginError = 'Username or PIN is incorrect.';
   bool _syncInProgress = false;
+  DateTime? _lastSilentSyncAt;
   int _busyDepth = 0;
   String? busyMessage;
 
@@ -191,6 +211,30 @@ class AppStore extends ChangeNotifier {
   String get licenseCountdownLabel =>
       formatLicenseCountdown(licenseExpiresAt, nowUtc: trustedNowUtc);
   bool get isBusy => _busyDepth > 0;
+
+  DateTime periodStart(String period) {
+    final now = DateTime.now();
+    return switch (period) {
+      'yearly' => DateTime(now.year),
+      'weekly' => DateTime(now.year, now.month, now.day)
+          .subtract(Duration(days: now.weekday - 1)),
+      'monthly' => DateTime(now.year, now.month),
+      _ => DateTime(now.year, now.month, now.day),
+    };
+  }
+
+  bool saleIsInPeriod(SaleRecord sale, String period) {
+    final saleDay = businessDate(sale.createdAt);
+    final today = businessDate(DateTime.now());
+    final weekStart = today.subtract(Duration(days: today.weekday - 1));
+    final weekEnd = weekStart.add(const Duration(days: 6));
+    return switch (period) {
+      'yearly' => saleDay.year == today.year,
+      'monthly' => saleDay.year == today.year && saleDay.month == today.month,
+      'weekly' => !saleDay.isBefore(weekStart) && !saleDay.isAfter(weekEnd),
+      _ => sameBusinessDay(sale.createdAt, DateTime.now()),
+    };
+  }
 
   Future<T> runBusy<T>(String message, Future<T> Function() operation) async {
     _busyDepth += 1;
@@ -208,17 +252,47 @@ class AppStore extends ChangeNotifier {
   BranchProfile? get currentBranch =>
       branches.where((branch) => branch.id == assignedBranchId).firstOrNull ??
       branches.firstOrNull;
+  List<BranchProfile> get accessibleBranches {
+    final user = currentUser;
+    if (user == null) return currentBranch == null ? [] : [currentBranch!];
+    if (user.isOwner || user.hasAllPrivileges) return [...branches];
+    final allowed = user.branchIds.toSet();
+    return branches.where((branch) => allowed.contains(branch.id)).toList();
+  }
+
+  bool get hasOpenCartItems =>
+      cart.isNotEmpty || openCarts.values.any((items) => items.isNotEmpty);
   int get cartTotalCents => cart.fold(
       0, (sum, item) => sum + item.product.priceCents * item.quantity);
   List<String> get openCartNames => openCarts.keys.toList();
   int get salesTodayCents =>
       sales.fold(0, (sum, sale) => sum + sale.totalCents);
   int get debtCents => sales
-      .where((sale) => sale.paymentMethod == 'Debt')
-      .fold(0, (sum, sale) => sum + sale.totalCents);
+      .where((sale) =>
+          sale.paymentMethod.toLowerCase() == 'debt' || sale.debtCents > 0)
+      .fold(0, (sum, sale) => sum + debtBalanceForSale(sale));
+  List<SaleRecord> get debtSales => sales
+      .where((sale) =>
+          sale.paymentMethod.toLowerCase() == 'debt' || sale.debtCents > 0)
+      .toList()
+    ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  List<SaleRecord> get allKnownDebtSales => allKnownSales
+      .where((sale) =>
+          sale.paymentMethod.toLowerCase() == 'debt' || sale.debtCents > 0)
+      .toList()
+    ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
   int voidedCentsForSale(String saleId) => saleVoids
       .where((voidRecord) => voidRecord.saleId == saleId)
       .fold(0, (sum, voidRecord) => sum + voidRecord.totalCents);
+  int debtBalanceForSale(SaleRecord sale) =>
+      max(0, sale.debtCents - voidedCentsForSale(sale.id));
+  String debtStatusForSale(SaleRecord sale) {
+    final balance = debtBalanceForSale(sale);
+    if (balance <= 0) return 'Fully paid';
+    if (sale.paidCents > 0) return 'Partially paid';
+    return 'Unpaid';
+  }
+
   int voidedQuantityForLine(String saleId, ReceiptLineSnapshot line) =>
       saleVoids
           .where((voidRecord) => voidRecord.saleId == saleId)
@@ -240,14 +314,8 @@ class AppStore extends ChangeNotifier {
   }
 
   ReportSnapshot reportSnapshot(String period, {required bool allBranches}) {
-    final now = DateTime.now();
-    final start = switch (period) {
-      'weekly' => DateTime(now.year, now.month, now.day)
-          .subtract(Duration(days: now.weekday - 1)),
-      'monthly' => DateTime(now.year, now.month),
-      _ => DateTime(now.year, now.month, now.day),
-    };
     final title = switch (period) {
+      'yearly' => 'Yearly Report',
       'weekly' => 'Weekly Report',
       'monthly' => 'Monthly Report',
       _ => 'Daily Report',
@@ -255,7 +323,7 @@ class AppStore extends ChangeNotifier {
     final source = allBranches ? allKnownSales : sales;
     final scoped = source
         .where((sale) =>
-            !sale.createdAt.isBefore(start) &&
+            saleIsInPeriod(sale, period) &&
             (allBranches ||
                 sale.branchId.isEmpty ||
                 sale.branchId == assignedBranchId))
@@ -265,16 +333,66 @@ class AppStore extends ChangeNotifier {
     final debt = scoped.fold(0, (sum, sale) => sum + sale.debtCents);
     final paid = scoped.fold(0, (sum, sale) => sum + sale.paidCents);
     final saleIds = scoped.map((sale) => sale.id).toSet();
-    final voided = saleVoids
+    final scopedVoids = saleVoids
         .where((voidRecord) => saleIds.contains(voidRecord.saleId))
-        .fold(0, (sum, voidRecord) => sum + voidRecord.totalCents);
+        .toList();
+    final voided =
+        scopedVoids.fold(0, (sum, voidRecord) => sum + voidRecord.totalCents);
     final netTotal = max(0, total - voided);
     final paymentTotal = (String label) => scoped
         .where((sale) => sale.paymentMethod.toLowerCase() == label)
         .fold(0, (sum, sale) => sum + sale.totalCents);
+    final productCostById = {
+      for (final product in products) product.id: product.costCents
+    };
+    int costForLine(ReceiptLineSnapshot line) {
+      if (line.lineCostCents > 0) return line.lineCostCents;
+      final unitCost = productCostById[line.productId] ?? 0;
+      return unitCost * line.quantity;
+    }
+
+    int netRevenueForLine(SaleRecord sale, ReceiptLineSnapshot line) {
+      final subtotal = max(1, sale.subtotalCents);
+      final discountShare =
+          ((sale.discountCents * line.lineTotalCents) / subtotal).round();
+      return max(0, line.lineTotalCents - discountShare);
+    }
+
+    final grossCost = scoped.fold(
+        0,
+        (sum, sale) =>
+            sum +
+            sale.lines.fold(0, (lineSum, line) => lineSum + costForLine(line)));
+    final voidedCost = scopedVoids.fold(
+        0,
+        (sum, voidRecord) =>
+            sum +
+            voidRecord.lines
+                .fold(0, (lineSum, line) => lineSum + costForLine(line)));
+    final netCost = max(0, grossCost - voidedCost);
+    final grossProfit = netTotal - netCost;
+    final margin = netTotal <= 0 ? 0.0 : (grossProfit / netTotal) * 100;
+    int stockQuantityForReport(Product product) {
+      if (!allBranches) return max(0, product.stock);
+      var totalQty = 0;
+      for (final snapshot in branchStockSnapshots.values) {
+        totalQty += max(0, snapshot[product.id] ?? 0);
+      }
+      return totalQty;
+    }
+
+    final stockValueAtCost = products.fold(
+        0,
+        (sum, product) =>
+            sum + stockQuantityForReport(product) * product.costCents);
+    final stockValueAtRetail = products.fold(
+        0,
+        (sum, product) =>
+            sum + stockQuantityForReport(product) * product.priceCents);
     final sold = <String, ReportProductPerformance>{};
     final performance = <String, UserPerformanceReport>{};
     for (final sale in scoped) {
+      final saleBranchName = branchNameForId(sale.branchId);
       final cashier =
           sale.cashier.trim().isEmpty ? 'Unknown user' : sale.cashier;
       final current = performance[cashier] ??
@@ -284,25 +402,42 @@ class AppStore extends ChangeNotifier {
               grossCents: 0,
               voidedCents: 0,
               netCents: 0,
+              costCents: 0,
+              profitCents: 0,
               debtCents: 0);
       final saleVoided = saleVoids
           .where((voidRecord) => voidRecord.saleId == sale.id)
           .fold(0, (sum, voidRecord) => sum + voidRecord.totalCents);
+      final saleCost =
+          sale.lines.fold(0, (sum, line) => sum + costForLine(line));
+      final saleNet = max(0, sale.totalCents - saleVoided);
       performance[cashier] = UserPerformanceReport(
           userName: cashier,
           transactionCount: current.transactionCount + 1,
           grossCents: current.grossCents + sale.totalCents,
           voidedCents: current.voidedCents + saleVoided,
-          netCents: current.netCents + max(0, sale.totalCents - saleVoided),
+          netCents: current.netCents + saleNet,
+          costCents: current.costCents + saleCost,
+          profitCents: current.profitCents + (saleNet - saleCost),
           debtCents: current.debtCents + sale.debtCents);
       for (final line in sale.lines) {
-        final current = sold[line.name] ??
+        final lineName = saleLineDisplayName(line);
+        final revenue = netRevenueForLine(sale, line);
+        final cost = costForLine(line);
+        final soldKey = allBranches ? '${sale.branchId}|$lineName' : lineName;
+        final current = sold[soldKey] ??
             ReportProductPerformance(
-                name: line.name, quantity: 0, revenueCents: 0);
-        sold[line.name] = ReportProductPerformance(
-            name: line.name,
+                name: lineName,
+                branchName: allBranches ? saleBranchName : '',
+                quantity: 0,
+                revenueCents: 0);
+        sold[soldKey] = ReportProductPerformance(
+            name: lineName,
+            branchName: allBranches ? saleBranchName : '',
             quantity: current.quantity + line.quantity,
-            revenueCents: current.revenueCents + line.lineTotalCents);
+            revenueCents: current.revenueCents + revenue,
+            costCents: current.costCents + cost,
+            profitCents: current.profitCents + (revenue - cost));
       }
     }
     final top = sold.values.toList()
@@ -320,6 +455,12 @@ class AppStore extends ChangeNotifier {
       grossSalesCents: total,
       voidedCents: voided,
       discountCents: discounts,
+      costOfGoodsCents: netCost,
+      grossProfitCents: grossProfit,
+      grossMarginPercent: margin,
+      stockValueAtCostCents: stockValueAtCost,
+      stockValueAtRetailCents: stockValueAtRetail,
+      potentialStockProfitCents: stockValueAtRetail - stockValueAtCost,
       debtCents: debt,
       paidCents: paid,
       transactionCount: scoped.length,
@@ -334,12 +475,66 @@ class AppStore extends ChangeNotifier {
     );
   }
 
+  String branchNameForId(String branchId) {
+    if (branchId.trim().isEmpty) {
+      return currentBranch?.name ?? company?.branchName ?? 'Unknown branch';
+    }
+    return branches
+            .where((branch) => branch.id == branchId)
+            .firstOrNull
+            ?.name ??
+        branchId;
+  }
+
+  String saleLineDisplayName(ReceiptLineSnapshot line) {
+    final savedName = line.name.trim();
+    if (savedName.isNotEmpty && savedName.toLowerCase() != 'product') {
+      return savedName;
+    }
+    if (line.productId.trim().isNotEmpty) {
+      final product =
+          products.where((item) => item.id == line.productId).firstOrNull;
+      if (product != null && product.name.trim().isNotEmpty) {
+        return product.name.trim();
+      }
+    }
+    return 'Unknown product';
+  }
+
+  List<SaleRecord> salesForCustomer(Customer customer) {
+    final name = customer.name.trim().toLowerCase();
+    return allKnownSales
+        .where((sale) =>
+            name.isNotEmpty && sale.customerName.trim().toLowerCase() == name)
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  }
+
+  List<SaleRecord> salesForCustomerName(String customerName) {
+    final name = customerName.trim().toLowerCase();
+    if (name.isEmpty) return [];
+    return allKnownSales
+        .where((sale) => sale.customerName.trim().toLowerCase() == name)
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  }
+
+  SaleRecord? saleById(String saleId) =>
+      allKnownSales.where((sale) => sale.id == saleId).firstOrNull;
+
+  bool discountExceedsCashierLimit(int discountCents) {
+    final user = currentUser;
+    if (discountCents <= 0) return false;
+    if (user == null || user.isOwner || user.hasAllPrivileges) return false;
+    return discountCents > (cartTotalCents * 0.1).round();
+  }
+
   Map<String, int> get currentBranchStockSnapshot => assignedBranchId == null
       ? {}
       : branchStockSnapshots[assignedBranchId] ?? {};
   List<Product> get currentBranchAssignedProducts {
     final branchId = assignedBranchId;
-    if (branchId == null || !branchStockInitialized.contains(branchId)) {
+    if (branchId == null) {
       return [];
     }
     final snapshot = currentBranchStockSnapshot;
@@ -347,6 +542,17 @@ class AppStore extends ChangeNotifier {
         .where((product) => snapshot.containsKey(product.id))
         .toList();
   }
+
+  bool productAssignedToAnyBranch(Product product) =>
+      branchStockSnapshots.values
+          .any((snapshot) => snapshot.containsKey(product.id));
+
+  List<Product> get activeCatalogueProducts => products
+      .where((product) =>
+          productAssignedToAnyBranch(product) ||
+          (branchStockInitialized.isEmpty && product.stock > 0))
+      .toList()
+    ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
   int catalogueStockFor(Product product) {
     if (branchStockInitialized.isEmpty) return product.stock;
@@ -358,14 +564,22 @@ class AppStore extends ChangeNotifier {
       total += snapshot[product.id] ?? 0;
       seen = true;
     }
-    return seen ? total : product.stock;
+    return seen ? total : 0;
   }
 
   int stockViewQuantityFor(Product product) {
     if (catalogueWideViewEnabled) return catalogueStockFor(product);
     final branchId = assignedBranchId;
-    if (branchId == null) return product.stock;
+    if (branchId == null) return 0;
     return branchStockSnapshots[branchId]?[product.id] ?? 0;
+  }
+
+  int branchQuantityForPurchase(Product product) {
+    final branchId = assignedBranchId;
+    if (branchId != null) {
+      return max(0, branchStockSnapshots[branchId]?[product.id] ?? 0);
+    }
+    return 0;
   }
 
   int sellableQuantityFor(Product product) => allowCatalogueWideSale
@@ -378,15 +592,21 @@ class AppStore extends ChangeNotifier {
   int branchAssignedProductCount(String branchId) {
     if (branchId == assignedBranchId) return currentBranchStockedProductCount;
     if (!branchStockInitialized.contains(branchId)) return 0;
+    final activeProductIds = products.map((product) => product.id).toSet();
     return (branchStockSnapshots[branchId] ?? {})
-        .values
+        .entries
+        .where((entry) => activeProductIds.contains(entry.key))
+        .map((entry) => entry.value)
         .where((quantity) => quantity > 0)
         .length;
   }
 
   int branchTotalStockQuantity(String branchId) {
+    final activeProductIds = products.map((product) => product.id).toSet();
     return (branchStockSnapshots[branchId] ?? {})
-        .values
+        .entries
+        .where((entry) => activeProductIds.contains(entry.key))
+        .map((entry) => entry.value)
         .fold(0, (sum, quantity) => sum + max(quantity, 0));
   }
 
@@ -418,17 +638,19 @@ Each device still needs its own Light Winter Technologies license voucher after 
         .trim();
   }
 
-  List<Product> get branchScopedProducts =>
-      catalogueWideViewEnabled ? products : currentBranchAssignedProducts;
+  List<Product> get branchScopedProducts => catalogueWideViewEnabled
+      ? activeCatalogueProducts
+      : currentBranchAssignedProducts;
   Set<String> get branchScopedSupplierIds => branchScopedProducts
       .map((product) => product.supplierId)
       .where((id) => id.trim().isNotEmpty)
       .toSet();
   List<Supplier> get branchScopedSuppliers => [...suppliers]
     ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
-  int get stockViewProductCount =>
-      catalogueWideViewEnabled ? products.length : currentBranchProductCount;
-  int get stockViewCategoryCount => products
+  int get stockViewProductCount => catalogueWideViewEnabled
+      ? activeCatalogueProducts.length
+      : currentBranchProductCount;
+  int get stockViewCategoryCount => branchScopedProducts
       .map((product) => product.category.trim())
       .where((category) => category.isNotEmpty)
       .toSet()
@@ -446,15 +668,233 @@ Each device still needs its own Light Winter Technologies license voucher after 
           (product) => branchStockQuantity(assignedBranchId ?? '', product) > 0)
       .length;
   int get stockViewTotalUnits => catalogueWideViewEnabled
-      ? products.fold(
+      ? activeCatalogueProducts.fold(
           0, (sum, product) => sum + max(catalogueStockFor(product), 0))
       : branchTotalStockQuantity(assignedBranchId ?? '');
-  int get allBranchesTotalUnits => products.fold(
+  int get allBranchesTotalUnits => activeCatalogueProducts.fold(
       0, (sum, product) => sum + max(catalogueStockFor(product), 0));
   int get currentBranchTotalUnits =>
       branchTotalStockQuantity(assignedBranchId ?? '');
-  int get allBranchesStockedProductCount =>
-      products.where((product) => catalogueStockFor(product) > 0).length;
+  int get allBranchesStockedProductCount => activeCatalogueProducts
+      .where((product) => catalogueStockFor(product) > 0)
+      .length;
+  int get stockValueAtAverageCostCents => branchScopedProducts.fold(
+      0,
+      (sum, product) =>
+          sum + max(0, stockViewQuantityFor(product)) * product.costCents);
+  int get stockValueAtFifoCostCents {
+    var total = 0;
+    for (final product in branchScopedProducts) {
+      var remaining = max(0, stockViewQuantityFor(product));
+      if (remaining <= 0) continue;
+      final layers = batchExpiryRecords
+          .where((record) =>
+              record.productName.toLowerCase() == product.name.toLowerCase() &&
+              (catalogueWideViewEnabled ||
+                  record.entry.branchId.isEmpty ||
+                  record.entry.branchId == assignedBranchId))
+          .toList()
+        ..sort((a, b) => b.entry.createdAt.compareTo(a.entry.createdAt));
+      for (final layer in layers) {
+        if (remaining <= 0) break;
+        final take = min(remaining, max(0, layer.quantity));
+        if (take <= 0) continue;
+        final unitCost = layer.quantity <= 0
+            ? product.costCents
+            : (layer.entry.amountCents / layer.quantity).round();
+        total += take * unitCost;
+        remaining -= take;
+      }
+      if (remaining > 0) total += remaining * product.costCents;
+    }
+    return total;
+  }
+
+  List<BatchExpiryRecord> get batchExpiryRecords {
+    final records = <BatchExpiryRecord>[];
+    for (final entry
+        in accountingEntries.where((entry) => entry.isStockPurchase)) {
+      final expiry = entry.batchExpiryDate;
+      if (expiry == null) continue;
+      final productName = entry.batchProductName;
+      records.add(BatchExpiryRecord(
+          entry: entry,
+          productName: productName,
+          batchNumber: entry.batchNumber,
+          expiryDate: expiry,
+          quantity: entry.batchQuantity));
+    }
+    records.sort((a, b) => a.expiryDate.compareTo(b.expiryDate));
+    return records;
+  }
+
+  List<BatchExpiryRecord> nearExpiryRecords({int days = 45}) {
+    final today = DateTime.now();
+    final limit =
+        DateTime(today.year, today.month, today.day).add(Duration(days: days));
+    return batchExpiryRecords
+        .where((record) => !record.expiryDate.isAfter(limit))
+        .toList();
+  }
+
+  List<AccountingEntry> payrollEntriesForPeriod(String period,
+          {required bool allBranches}) =>
+      accountingEntriesForPeriod(period, allBranches: allBranches)
+          .where((entry) => entry.isPayroll)
+          .toList();
+
+  List<AuditRow> auditRows({required bool allBranches}) {
+    final rows = <AuditRow>[];
+    bool scopedBranch(String branchId) =>
+        allBranches ||
+        branchId.isEmpty ||
+        assignedBranchId == null ||
+        branchId == assignedBranchId;
+    for (final sale
+        in allKnownSales.where((sale) => scopedBranch(sale.branchId))) {
+      rows.add(AuditRow(
+          when: sale.createdAt,
+          action: 'Sale',
+          actor: sale.cashier,
+          branch: branchNameForId(sale.branchId),
+          detail:
+              '${sale.paymentMethod} | ${sale.lines.length} lines | ${moneyFor(sale.totalCents)}'));
+    }
+    for (final item
+        in saleVoids.where((voidRecord) => scopedBranch(voidRecord.branchId))) {
+      rows.add(AuditRow(
+          when: item.createdAt,
+          action: item.type.replaceAll('_', ' '),
+          actor: item.userName,
+          branch: branchNameForId(item.branchId),
+          detail: '${item.reason} | ${moneyFor(item.totalCents)}'));
+    }
+    for (final transfer in stockTransfers.where((item) =>
+        scopedBranch(item.fromBranchId) || scopedBranch(item.toBranchId))) {
+      rows.add(AuditRow(
+          when: transfer.createdAt,
+          action: 'Stock transfer',
+          actor: transfer.userName,
+          branch:
+              '${branchNameForId(transfer.fromBranchId)} -> ${branchNameForId(transfer.toBranchId)}',
+          detail: '${transfer.productName} x ${transfer.quantity}'));
+    }
+    for (final entry
+        in accountingEntries.where((entry) => scopedBranch(entry.branchId))) {
+      rows.add(AuditRow(
+          when: entry.createdAt,
+          action: entry.category,
+          actor: entry.counterparty.isEmpty ? '-' : entry.counterparty,
+          branch: branchNameForId(entry.branchId),
+          detail: '${entry.description} | ${moneyFor(entry.amountCents)}'));
+    }
+    rows.sort((a, b) => b.when.compareTo(a.when));
+    return rows;
+  }
+
+  List<SmartInsight> smartInsights(ReportSnapshot report,
+      {required bool allBranches}) {
+    final insights = <SmartInsight>[];
+    void add(SmartInsight insight) {
+      if (insights.length < 8) insights.add(insight);
+    }
+
+    if (report.sales.isEmpty) {
+      add(const SmartInsight(
+          tone: Tone.neutral,
+          title: 'No sales in this period',
+          body:
+              'Record sales first. Insights become stronger when the shop has real sales, stock, and expense history.',
+          icon: Icons.auto_awesome));
+    }
+    if (outOfStockCount > 0) {
+      add(SmartInsight(
+          tone: Tone.danger,
+          title: '$outOfStockCount items out of stock',
+          body:
+              'Review the Stock section and restock the items that should still be available for selling.',
+          icon: Icons.remove_shopping_cart));
+    }
+    if (lowStockCount > 0) {
+      add(SmartInsight(
+          tone: Tone.warning,
+          title: '$lowStockCount low-stock items',
+          body:
+              'These products are at or below their reorder threshold. Check fast movers before the next busy period.',
+          icon: Icons.warning_amber));
+    }
+    final expiry = nearExpiryRecords(days: 30);
+    if (expiry.isNotEmpty) {
+      final first = expiry.first;
+      add(SmartInsight(
+          tone: first.expired ? Tone.danger : Tone.warning,
+          title: '${expiry.length} batch expiry alerts',
+          body:
+              '${first.productName} ${first.expired ? 'has expired' : 'expires in ${first.daysLeft} days'}. Review batch/expiry tracking in Stock.',
+          icon: Icons.event_busy));
+    }
+    if (report.grossProfitCents < 0 && report.transactionCount > 0) {
+      add(SmartInsight(
+          tone: Tone.danger,
+          title: 'Loss detected',
+          body:
+              'Recorded cost is higher than net sales in this period. Check selling prices, discounts, and buying costs.',
+          icon: Icons.trending_down));
+    } else if (report.totalSalesCents > 0 && report.grossMarginPercent < 15) {
+      add(SmartInsight(
+          tone: Tone.warning,
+          title: 'Low gross margin',
+          body:
+              'Gross margin is ${report.grossMarginPercent.toStringAsFixed(1)}%. Review buying costs, selling prices, and discounts.',
+          icon: Icons.percent));
+    }
+    if (report.grossSalesCents > 0 &&
+        report.voidedCents / report.grossSalesCents >= 0.1) {
+      add(SmartInsight(
+          tone: Tone.warning,
+          title: 'High void/return value',
+          body:
+              'Voids and returns are above 10% of gross sales. Open Customers and Debt to review the transaction history.',
+          icon: Icons.assignment_return));
+    }
+    if (report.grossSalesCents > 0 &&
+        report.discountCents / report.grossSalesCents >= 0.1) {
+      add(SmartInsight(
+          tone: Tone.warning,
+          title: 'Discounts are high',
+          body:
+              'Discounts are above 10% of gross sales. Confirm that only approved staff are giving discounts.',
+          icon: Icons.local_offer));
+    }
+    if (debtCents > 0) {
+      add(SmartInsight(
+          tone: Tone.warning,
+          title: 'Customer debt outstanding',
+          body:
+              '${moneyFor(debtCents)} is still unpaid. Use customer statements to follow up before debt gets old.',
+          icon: Icons.account_balance_wallet));
+    }
+    if (report.topProducts.isNotEmpty) {
+      final top = report.topProducts.first;
+      add(SmartInsight(
+          tone: Tone.good,
+          title: 'Fast mover: ${top.name}',
+          body:
+              'Sold ${top.quantity} units in this period. Keep this item visible and stocked.',
+          icon: Icons.bolt));
+    }
+    if (report.slowProducts.isNotEmpty) {
+      final slow = report.slowProducts.first;
+      add(SmartInsight(
+          tone: Tone.neutral,
+          title: 'Slow mover: ${slow.name}',
+          body:
+              'No sales recorded for this stocked item in the selected period. Consider checking price or shelf position.',
+          icon: Icons.hourglass_bottom));
+    }
+    return insights;
+  }
+
   bool get canUseCentralCatalogueMode {
     final user = currentUser;
     if (user == null) return false;
@@ -470,14 +910,14 @@ Each device still needs its own Light Winter Technologies license voucher after 
 
   String exportCurrentStockCsv() {
     final branchName = currentBranch?.name ?? 'Unassigned branch';
-    final scope =
-        catalogueWideViewEnabled ? 'All branches' : 'Current branch';
+    final scope = catalogueWideViewEnabled ? 'All branches' : 'Current branch';
     final rows = <List<String>>[
       [
         'Product Name',
         'Category',
         'SKU',
-        'Price',
+        'Cost Price',
+        'Selling Price',
         'Current Stock',
         'Low Stock Threshold',
         'Supplier',
@@ -491,13 +931,13 @@ Each device still needs its own Light Winter Technologies license voucher after 
         .toList()
       ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     for (final product in exportProducts) {
-      final supplier = suppliers
-          .where((item) => item.id == product.supplierId)
-          .firstOrNull;
+      final supplier =
+          suppliers.where((item) => item.id == product.supplierId).firstOrNull;
       rows.add([
         product.name,
         product.category,
         product.sku,
+        moneyFor(product.costCents),
         moneyFor(product.priceCents),
         '${stockViewQuantityFor(product)}',
         '${product.reorderLevel}',
@@ -527,7 +967,13 @@ Each device still needs its own Light Winter Technologies license voucher after 
 
   void setDisplayCurrency(String currency) {
     displayCurrency = currency;
-    save();
+    unawaited(save());
+    notifyListeners();
+  }
+
+  void setPosCurrency(String currency) {
+    posCurrency = currency;
+    unawaited(save());
     notifyListeners();
   }
 
@@ -544,10 +990,31 @@ Each device still needs its own Light Winter Technologies license voucher after 
       ..writeln('Gross sales: ${moneyFor(report.grossSalesCents)}')
       ..writeln('Voids/returns: ${moneyFor(report.voidedCents)}')
       ..writeln('Net sales: ${moneyFor(report.totalSalesCents)}')
+      ..writeln('Cost of goods sold: ${moneyFor(report.costOfGoodsCents)}')
+      ..writeln('Gross profit: ${moneyFor(report.grossProfitCents)}')
+      ..writeln(
+          'Gross margin: ${report.grossMarginPercent.toStringAsFixed(1)}%')
       ..writeln('Transactions: ${report.transactionCount}')
       ..writeln('Average sale: ${moneyFor(report.averageSaleCents)}')
       ..writeln('Discounts: ${moneyFor(report.discountCents)}')
       ..writeln('Debt recorded: ${moneyFor(report.debtCents)}')
+      ..writeln(
+          'Stock value at cost: ${moneyFor(report.stockValueAtCostCents)}')
+      ..writeln(
+          'Stock value at selling price: ${moneyFor(report.stockValueAtRetailCents)}')
+      ..writeln(
+          'Potential stock profit: ${moneyFor(report.potentialStockProfitCents)}')
+      ..writeln('')
+      ..writeln('Smart Business Insights');
+    final insights = smartInsights(report, allBranches: allBranches);
+    if (insights.isEmpty) {
+      buffer.writeln('No major insights for this period.');
+    } else {
+      for (final insight in insights) {
+        buffer.writeln('${insight.title}: ${insight.body}');
+      }
+    }
+    buffer
       ..writeln('')
       ..writeln('Payment mix')
       ..writeln('Cash: ${moneyFor(report.cashCents)}')
@@ -560,7 +1027,7 @@ Each device still needs its own Light Winter Technologies license voucher after 
     } else {
       for (final product in report.topProducts) {
         buffer.writeln(
-            '${product.name}: ${product.quantity} sold, ${moneyFor(product.revenueCents)}');
+            '${product.name}${product.branchName.isEmpty ? '' : ' (${product.branchName})'}: ${product.quantity} sold, sales ${moneyFor(product.revenueCents)}, cost ${moneyFor(product.costCents)}, profit ${moneyFor(product.profitCents)}');
       }
     }
     buffer
@@ -581,20 +1048,639 @@ Each device still needs its own Light Winter Technologies license voucher after 
     } else {
       for (final user in report.userPerformance) {
         buffer.writeln(
-            '${user.userName}: ${user.transactionCount} sales, gross ${moneyFor(user.grossCents)}, voided ${moneyFor(user.voidedCents)}, net ${moneyFor(user.netCents)}, debt ${moneyFor(user.debtCents)}');
+            '${user.userName}: ${user.transactionCount} sales, gross ${moneyFor(user.grossCents)}, voided ${moneyFor(user.voidedCents)}, net ${moneyFor(user.netCents)}, cost ${moneyFor(user.costCents)}, profit ${moneyFor(user.profitCents)}, debt ${moneyFor(user.debtCents)}');
       }
     }
     buffer
       ..writeln('')
-      ..writeln('Profit and loss note')
-      ..writeln(
-          'True profit requires buying cost per product. Current report shows sales, discounts, debt, payment mix, and stock movement from synced data.');
+      ..writeln('Transaction details');
+    if (report.sales.isEmpty) {
+      buffer.writeln('No transactions in this period.');
+    } else {
+      for (final sale in report.sales) {
+        buffer
+          ..writeln(
+              '${sale.createdAt} | Branch: ${branchNameForId(sale.branchId)} | ${sale.cashier} | ${sale.paymentMethod} | ${moneyFor(sale.totalCents)}')
+          ..writeln(
+              'Customer: ${sale.customerName.isEmpty ? '-' : sale.customerName}');
+        for (final line in sale.lines) {
+          buffer.writeln(
+              '  ${saleLineDisplayName(line)}: qty ${line.quantity}, selling ${moneyFor(line.lineTotalCents)}, cost ${moneyFor(line.lineCostCents)}, profit ${moneyFor(line.lineTotalCents - line.lineCostCents)}');
+        }
+      }
+    }
     return buffer.toString();
+  }
+
+  List<AccountingEntry> accountingEntriesForPeriod(String period,
+      {required bool allBranches}) {
+    return accountingEntries
+        .where((entry) =>
+            entryIsInPeriod(entry, period) &&
+            (allBranches ||
+                entry.branchId.isEmpty ||
+                entry.branchId == assignedBranchId))
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  }
+
+  bool entryIsInPeriod(AccountingEntry entry, String period) {
+    final entryDay = businessDate(entry.createdAt);
+    final today = businessDate(DateTime.now());
+    final weekStart = today.subtract(Duration(days: today.weekday - 1));
+    final weekEnd = weekStart.add(const Duration(days: 6));
+    return switch (period) {
+      'yearly' => entryDay.year == today.year,
+      'monthly' => entryDay.year == today.year && entryDay.month == today.month,
+      'weekly' => !entryDay.isBefore(weekStart) && !entryDay.isAfter(weekEnd),
+      _ => sameBusinessDay(entry.createdAt, DateTime.now()),
+    };
+  }
+
+  ProfitLossStatement profitLossStatement(String period,
+      {required bool allBranches}) {
+    final report = reportSnapshot(period, allBranches: allBranches);
+    final entries =
+        accountingEntriesForPeriod(period, allBranches: allBranches);
+    final allScopedEntries = accountingEntries
+        .where((entry) =>
+            allBranches ||
+            entry.branchId.isEmpty ||
+            entry.branchId == assignedBranchId)
+        .toList();
+    final expenses = entries.where((entry) =>
+        entry.type == AccountingEntryType.expense &&
+        entry.affectsProfitAndLoss);
+    final incomes = entries.where((entry) =>
+        entry.type == AccountingEntryType.income && entry.affectsProfitAndLoss);
+    final stockPurchases =
+        entries.where((entry) => entry.isStockPurchase).toList();
+    final supplierPayments =
+        entries.where((entry) => entry.isSupplierPayment).toList();
+    final ownerCapital = entries
+        .where((entry) => entry.category.toLowerCase() == 'owner capital')
+        .fold(0, (sum, entry) => sum + entry.amountCents);
+    final ownerDrawings = entries
+        .where((entry) => entry.isOwnerDrawing)
+        .fold(0, (sum, entry) => sum + entry.amountCents);
+    final operatingExpenses =
+        expenses.fold(0, (sum, entry) => sum + entry.amountCents);
+    final otherIncome =
+        incomes.fold(0, (sum, entry) => sum + entry.amountCents);
+    final stockPurchaseTotal =
+        stockPurchases.fold(0, (sum, entry) => sum + entry.amountCents);
+    final supplierPaymentTotal =
+        supplierPayments.fold(0, (sum, entry) => sum + entry.amountCents);
+    final supplierBalances = supplierBalanceMap(allScopedEntries);
+    final supplierPayables = supplierBalances.values
+        .where((amount) => amount > 0)
+        .fold(0, (sum, amount) => sum + amount);
+    final expensesByCategory = <String, int>{};
+    for (final entry in expenses) {
+      expensesByCategory[entry.category] =
+          (expensesByCategory[entry.category] ?? 0) + entry.amountCents;
+    }
+    final incomeByCategory = <String, int>{};
+    for (final entry in incomes) {
+      incomeByCategory[entry.category] =
+          (incomeByCategory[entry.category] ?? 0) + entry.amountCents;
+    }
+    final netProfit = report.grossProfitCents + otherIncome - operatingExpenses;
+    final netMargin = report.totalSalesCents <= 0
+        ? 0.0
+        : (netProfit / report.totalSalesCents) * 100;
+    return ProfitLossStatement(
+        period: period,
+        report: report,
+        entries: entries,
+        operatingExpensesCents: operatingExpenses,
+        otherIncomeCents: otherIncome,
+        netProfitCents: netProfit,
+        netMarginPercent: netMargin,
+        stockPurchasesCents: stockPurchaseTotal,
+        supplierPaymentsCents: supplierPaymentTotal,
+        supplierPayablesCents: supplierPayables,
+        customerDebtOutstandingCents: debtCents,
+        ownerCapitalCents: ownerCapital,
+        ownerDrawingsCents: ownerDrawings,
+        supplierBalances: supplierBalances,
+        cashbookByMethod: cashbookByMethod(period, allBranches: allBranches),
+        customerDebtAging: customerDebtAging(),
+        expensesByCategory: expensesByCategory,
+        incomeByCategory: incomeByCategory);
+  }
+
+  Map<String, int> supplierBalanceMap(List<AccountingEntry> entries) {
+    final balances = <String, int>{};
+    for (final entry in entries) {
+      final supplier = entry.counterparty.trim().isEmpty
+          ? 'Unknown supplier'
+          : entry.counterparty.trim();
+      if (entry.isStockPurchase) {
+        balances[supplier] = (balances[supplier] ?? 0) + entry.amountCents;
+      } else if (entry.isSupplierPayment) {
+        balances[supplier] = (balances[supplier] ?? 0) - entry.amountCents;
+      }
+    }
+    return balances;
+  }
+
+  Map<String, int> cashbookByMethod(String period,
+      {required bool allBranches}) {
+    final start = periodStart(period);
+    final scopedSales = (allBranches ? allKnownSales : sales)
+        .where((sale) => !sale.createdAt.isBefore(start));
+    final result = <String, int>{
+      'Cash in': 0,
+      'Card in': 0,
+      'Mobile money in': 0,
+      'Bank in': 0,
+      'Cash out': 0,
+      'Mobile money out': 0,
+      'Bank out': 0,
+    };
+    for (final sale in scopedSales) {
+      final method = sale.paymentMethod.toLowerCase();
+      final paid = max(0, sale.paidCents - sale.changeCents);
+      if (paid <= 0) continue;
+      if (method.contains('card')) {
+        result['Card in'] = result['Card in']! + paid;
+      } else if (method.contains('mobile')) {
+        result['Mobile money in'] = result['Mobile money in']! + paid;
+      } else {
+        result['Cash in'] = result['Cash in']! + paid;
+      }
+    }
+    for (final entry
+        in accountingEntriesForPeriod(period, allBranches: allBranches)) {
+      final method = entry.paymentMethod.toLowerCase();
+      if (entry.isOwnerDrawing ||
+          entry.isSupplierPayment ||
+          entry.affectsProfitAndLoss) {
+        final key = method.contains('bank')
+            ? 'Bank out'
+            : method.contains('mobile')
+                ? 'Mobile money out'
+                : 'Cash out';
+        result[key] = result[key]! + entry.amountCents;
+      } else if (entry.type == AccountingEntryType.income) {
+        final key = method.contains('bank')
+            ? 'Bank in'
+            : method.contains('mobile')
+                ? 'Mobile money in'
+                : 'Cash in';
+        result[key] = result[key]! + entry.amountCents;
+      }
+    }
+    return result;
+  }
+
+  Map<String, int> customerDebtAging() {
+    final result = <String, int>{
+      '0-7 days': 0,
+      '8-30 days': 0,
+      '31-60 days': 0,
+      'Over 60 days': 0,
+    };
+    final now = DateTime.now();
+    for (final sale in debtSales) {
+      final balance = debtBalanceForSale(sale);
+      if (balance <= 0) continue;
+      final days = now.difference(sale.createdAt).inDays;
+      final bucket = days <= 7
+          ? '0-7 days'
+          : days <= 30
+              ? '8-30 days'
+              : days <= 60
+                  ? '31-60 days'
+                  : 'Over 60 days';
+      result[bucket] = result[bucket]! + balance;
+    }
+    return result;
+  }
+
+  String profitLossText(ProfitLossStatement statement,
+      {required bool allBranches}) {
+    final scope =
+        allBranches ? 'All branches' : currentBranch?.name ?? 'Current branch';
+    final buffer = StringBuffer()
+      ..writeln('Light Winter RetailOS')
+      ..writeln('Profit and Loss Statement')
+      ..writeln('Shop: ${company?.shopName ?? ''}')
+      ..writeln('Scope: $scope')
+      ..writeln('Period: ${statement.title}')
+      ..writeln('Generated: ${DateTime.now()}')
+      ..writeln('')
+      ..writeln('Revenue')
+      ..writeln(
+          'Gross recorded sales: ${moneyFor(statement.report.grossSalesCents)}')
+      ..writeln('Voids / returns: ${moneyFor(statement.report.voidedCents)}')
+      ..writeln('Discounts: ${moneyFor(statement.report.discountCents)}')
+      ..writeln('Net sales: ${moneyFor(statement.report.totalSalesCents)}')
+      ..writeln('Other income: ${moneyFor(statement.otherIncomeCents)}')
+      ..writeln('Owner capital: ${moneyFor(statement.ownerCapitalCents)}')
+      ..writeln('')
+      ..writeln('Cost of Sales')
+      ..writeln(
+          'Cost of goods sold: ${moneyFor(statement.report.costOfGoodsCents)}')
+      ..writeln('Stock purchases: ${moneyFor(statement.stockPurchasesCents)}')
+      ..writeln('Gross profit: ${moneyFor(statement.report.grossProfitCents)}')
+      ..writeln(
+          'Gross margin: ${statement.report.grossMarginPercent.toStringAsFixed(1)}%')
+      ..writeln('')
+      ..writeln('Operating Expenses')
+      ..writeln(
+          'Total expenses: ${moneyFor(statement.operatingExpensesCents)}');
+    if (statement.expensesByCategory.isEmpty) {
+      buffer.writeln('No operating expenses recorded.');
+    } else {
+      for (final entry in statement.expensesByCategory.entries) {
+        buffer.writeln('${entry.key}: ${moneyFor(entry.value)}');
+      }
+    }
+    buffer
+      ..writeln('')
+      ..writeln('Net Profit / Loss')
+      ..writeln('Owner drawings: ${moneyFor(statement.ownerDrawingsCents)}')
+      ..writeln('Net profit: ${moneyFor(statement.netProfitCents)}')
+      ..writeln('Net margin: ${statement.netMarginPercent.toStringAsFixed(1)}%')
+      ..writeln('')
+      ..writeln('Supplier and Customer Balances')
+      ..writeln('Supplier bills: ${moneyFor(statement.stockPurchasesCents)}')
+      ..writeln(
+          'Supplier payments: ${moneyFor(statement.supplierPaymentsCents)}')
+      ..writeln('Supplier owing: ${moneyFor(statement.supplierPayablesCents)}')
+      ..writeln(
+          'Customer debt outstanding: ${moneyFor(statement.customerDebtOutstandingCents)}')
+      ..writeln('')
+      ..writeln('Stock Position')
+      ..writeln(
+          'Stock value at cost: ${moneyFor(statement.report.stockValueAtCostCents)}')
+      ..writeln(
+          'Stock value at selling price: ${moneyFor(statement.report.stockValueAtRetailCents)}')
+      ..writeln(
+          'Potential stock profit: ${moneyFor(statement.report.potentialStockProfitCents)}')
+      ..writeln(
+          'Average-cost valuation: ${moneyFor(stockValueAtAverageCostCents)}')
+      ..writeln('FIFO layer valuation: ${moneyFor(stockValueAtFifoCostCents)}');
+    final expiryRows = nearExpiryRecords();
+    buffer
+      ..writeln('')
+      ..writeln('Batch / Expiry Watch');
+    if (expiryRows.isEmpty) {
+      buffer.writeln('No expired or near-expiry batches in the next 45 days.');
+    } else {
+      for (final record in expiryRows.take(40)) {
+        buffer.writeln(
+            '${record.productName} | Batch ${record.batchNumber.isEmpty ? '-' : record.batchNumber} | Qty ${record.quantity} | Expiry ${shortDate(record.expiryDate)} | ${record.expired ? 'Expired' : '${record.daysLeft} days left'}');
+      }
+    }
+    final payrollRows =
+        statement.entries.where((entry) => entry.isPayroll).toList();
+    buffer
+      ..writeln('')
+      ..writeln('Payroll / HR');
+    if (payrollRows.isEmpty) {
+      buffer.writeln('No payroll recorded in this period.');
+    } else {
+      for (final entry in payrollRows.take(80)) {
+        buffer.writeln(
+            '${shortDate(entry.createdAt)} | ${entry.counterparty} | ${entry.description} | ${moneyFor(entry.amountCents)}');
+      }
+    }
+    buffer
+      ..writeln('')
+      ..writeln('Cashbook Summary');
+    for (final entry in statement.cashbookByMethod.entries) {
+      buffer.writeln('${entry.key}: ${moneyFor(entry.value)}');
+    }
+    buffer
+      ..writeln('')
+      ..writeln('Debt Aging');
+    for (final entry in statement.customerDebtAging.entries) {
+      buffer.writeln('${entry.key}: ${moneyFor(entry.value)}');
+    }
+    buffer
+      ..writeln('')
+      ..writeln('Expense / Income Register');
+    if (statement.entries.isEmpty) {
+      buffer.writeln('No manual accounting entries recorded.');
+    } else {
+      for (final entry in statement.entries.take(200)) {
+        buffer.writeln(
+            '${shortDateTime(entry.createdAt)} | ${entry.typeLabel} | ${entry.category} | ${moneyFor(entry.amountCents)} | ${entry.description}');
+      }
+    }
+    return buffer.toString();
+  }
+
+  Future<void> addAccountingEntry(AccountingEntry entry) async {
+    if (_busyDepth == 0) {
+      return runBusy(
+          'Saving accounting entry...', () => addAccountingEntry(entry));
+    }
+    accountingEntries.insert(0, entry);
+    await save();
+    notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncAccountingEntryCreate(entry));
+    }
+  }
+
+  Future<void> recordStockPurchase({
+    required Product? product,
+    required String productName,
+    required String supplierName,
+    required int quantity,
+    required int totalCents,
+    required int paidCents,
+    required String paymentMethod,
+    String batchNumber = '',
+    DateTime? expiryDate,
+  }) async {
+    if (_busyDepth == 0) {
+      return runBusy(
+          'Recording stock purchase...',
+          () => recordStockPurchase(
+              product: product,
+              productName: productName,
+              supplierName: supplierName,
+              quantity: quantity,
+              totalCents: totalCents,
+              paidCents: paidCents,
+              paymentMethod: paymentMethod,
+              batchNumber: batchNumber,
+              expiryDate: expiryDate));
+    }
+    final cleanSupplier =
+        supplierName.trim().isEmpty ? 'Unknown supplier' : supplierName.trim();
+    final purchaseName = product?.name ??
+        (productName.trim().isEmpty ? 'stock purchase' : productName.trim());
+    if (product != null && quantity > 0) {
+      final unitCost = (totalCents / quantity).round();
+      final beforeQuantity = branchQuantityForPurchase(product);
+      final newQuantity = beforeQuantity + quantity;
+      final previousValue = beforeQuantity * product.costCents;
+      final weightedCost = newQuantity <= 0
+          ? unitCost
+          : ((previousValue + totalCents) / newQuantity).round();
+      product.stock = newQuantity;
+      if (weightedCost > 0) product.costCents = weightedCost;
+      _markCurrentBranchStockInitialized();
+      if (organizationId != null && currentBranch != null) {
+        unawaited(_syncProductUpdate(product, currentBranch!.id));
+      }
+    }
+    final details = <String>[
+      if (quantity > 0) '$quantity x $purchaseName' else purchaseName,
+      if (batchNumber.trim().isNotEmpty) 'Batch: ${batchNumber.trim()}',
+      if (expiryDate != null) 'Expiry: ${shortDate(expiryDate)}',
+    ].join(' | ');
+    await addAccountingEntry(AccountingEntry(
+        id: newId(),
+        branchId: assignedBranchId ?? '',
+        type: AccountingEntryType.expense,
+        category: 'Stock Purchase',
+        description: details,
+        amountCents: totalCents,
+        paymentMethod:
+            paidCents >= totalCents ? paymentMethod : 'Supplier debt',
+        counterparty: cleanSupplier,
+        createdAt: DateTime.now()));
+    final appliedPayment = min(max(0, paidCents), totalCents);
+    if (appliedPayment > 0) {
+      await addAccountingEntry(AccountingEntry(
+          id: newId(),
+          branchId: assignedBranchId ?? '',
+          type: AccountingEntryType.expense,
+          category: 'Supplier Payment',
+          description: 'Payment for $purchaseName',
+          amountCents: appliedPayment,
+          paymentMethod: paymentMethod,
+          counterparty: cleanSupplier,
+          createdAt: DateTime.now()));
+    }
+    syncStatus = 'Stock purchase recorded.';
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> recordStockCount({
+    required Product product,
+    required int countedQuantity,
+    required String reason,
+  }) async {
+    if (_busyDepth == 0) {
+      return runBusy(
+          'Recording stock count...',
+          () => recordStockCount(
+              product: product,
+              countedQuantity: countedQuantity,
+              reason: reason));
+    }
+    final before = stockViewQuantityFor(product);
+    final delta = countedQuantity - before;
+    product.stock = countedQuantity;
+    _markCurrentBranchStockInitialized();
+    await addAccountingEntry(AccountingEntry(
+        id: newId(),
+        branchId: assignedBranchId ?? '',
+        type: AccountingEntryType.expense,
+        category: 'Stock Count',
+        description:
+            '${product.name}: counted $countedQuantity, system $before, difference $delta. ${reason.trim()}',
+        amountCents: (delta.abs() * product.costCents),
+        paymentMethod: 'Stock adjustment',
+        counterparty: currentUser?.name ?? '',
+        createdAt: DateTime.now()));
+    if (organizationId != null && currentBranch != null) {
+      unawaited(_syncProductUpdate(product, currentBranch!.id));
+    }
+    syncStatus = 'Stock count recorded.';
+    await save();
+    notifyListeners();
+  }
+
+  String customerStatementText(SaleRecord sale) {
+    final related = debtSales.where((item) {
+      if (sale.customerName.trim().isEmpty) return item.id == sale.id;
+      return item.customerName.trim().toLowerCase() ==
+          sale.customerName.trim().toLowerCase();
+    }).toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    final totalDebt =
+        related.fold(0, (sum, item) => sum + debtBalanceForSale(item));
+    final buffer = StringBuffer()
+      ..writeln('Light Winter RetailOS')
+      ..writeln('Customer Statement')
+      ..writeln('Shop: ${company?.shopName ?? ''}')
+      ..writeln(
+          'Customer: ${sale.customerName.isEmpty ? 'Customer' : sale.customerName}')
+      ..writeln('Generated: ${DateTime.now()}')
+      ..writeln('')
+      ..writeln('Outstanding balance: ${moneyFor(totalDebt)}')
+      ..writeln('')
+      ..writeln('Debt History');
+    for (final item in related) {
+      buffer.writeln(
+          '${shortDateTime(item.createdAt)} | Sale ${item.id} | Total ${moneyFor(item.totalCents)} | Paid ${moneyFor(item.paidCents)} | Balance ${moneyFor(debtBalanceForSale(item))} | ${debtStatusForSale(item)}');
+    }
+    return buffer.toString();
+  }
+
+  String customerPurchaseHistoryText(String customerName) {
+    final related = salesForCustomerName(customerName);
+    final total = related.fold(0, (sum, item) => sum + item.totalCents);
+    final debt = related.fold(0, (sum, item) => sum + debtBalanceForSale(item));
+    final buffer = StringBuffer()
+      ..writeln('Light Winter RetailOS')
+      ..writeln('Customer Purchase History')
+      ..writeln('Shop: ${company?.shopName ?? ''}')
+      ..writeln(
+          'Customer: ${customerName.trim().isEmpty ? 'Customer' : customerName.trim()}')
+      ..writeln('Generated: ${DateTime.now()}')
+      ..writeln('')
+      ..writeln('Total purchases: ${moneyFor(total)}')
+      ..writeln('Outstanding debt: ${moneyFor(debt)}')
+      ..writeln('')
+      ..writeln('Transactions');
+    for (final item in related) {
+      final lines = item.lines
+          .map((line) => '${line.quantity}x ${saleLineDisplayName(line)}')
+          .join(', ');
+      buffer.writeln(
+          '${shortDateTime(item.createdAt)} | ${branchNameForId(item.branchId)} | ${item.paymentMethod} | ${item.cashier} | ${moneyFor(item.totalCents)} | ${lines.isEmpty ? 'No line detail' : lines}');
+    }
+    return buffer.toString();
+  }
+
+  String debtLedgerText(List<SaleRecord> debts) {
+    final total = debts.fold(0, (sum, item) => sum + item.totalCents);
+    final paid = debts.fold(0, (sum, item) => sum + item.paidCents);
+    final balance =
+        debts.fold(0, (sum, item) => sum + debtBalanceForSale(item));
+    final buffer = StringBuffer()
+      ..writeln('Light Winter RetailOS')
+      ..writeln('Debt Ledger')
+      ..writeln('Shop: ${company?.shopName ?? ''}')
+      ..writeln('Branch: ${currentBranch?.name ?? 'All visible branches'}')
+      ..writeln('Generated: ${DateTime.now()}')
+      ..writeln('')
+      ..writeln('Debt sales total: ${moneyFor(total)}')
+      ..writeln('Paid so far: ${moneyFor(paid)}')
+      ..writeln('Outstanding: ${moneyFor(balance)}')
+      ..writeln('')
+      ..writeln('Ledger');
+    for (final sale in debts) {
+      buffer.writeln(
+          '${shortDateTime(sale.createdAt)} | ${branchNameForId(sale.branchId)} | ${sale.customerName.isEmpty ? 'Customer' : sale.customerName} | Sale ${sale.id} | Total ${moneyFor(sale.totalCents)} | Paid ${moneyFor(sale.paidCents)} | Balance ${moneyFor(debtBalanceForSale(sale))} | ${debtStatusForSale(sale)} | Cashier ${sale.cashier}');
+    }
+    return buffer.toString();
+  }
+
+  String supplierStatementText(String supplierName) {
+    final clean = supplierName.trim();
+    final entries = accountingEntries
+        .where((entry) =>
+            entry.counterparty.trim().toLowerCase() == clean.toLowerCase() &&
+            (entry.isStockPurchase || entry.isSupplierPayment))
+        .toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    final balance = supplierBalanceMap(entries)[clean] ?? 0;
+    final buffer = StringBuffer()
+      ..writeln('Light Winter RetailOS')
+      ..writeln('Supplier Statement')
+      ..writeln('Shop: ${company?.shopName ?? ''}')
+      ..writeln('Supplier: ${clean.isEmpty ? 'Supplier' : clean}')
+      ..writeln('Generated: ${DateTime.now()}')
+      ..writeln('')
+      ..writeln('Balance owing: ${moneyFor(balance)}')
+      ..writeln('')
+      ..writeln('Purchases and Payments');
+    for (final entry in entries) {
+      buffer.writeln(
+          '${shortDateTime(entry.createdAt)} | ${entry.category} | ${entry.description} | ${moneyFor(entry.amountCents)} | ${entry.paymentMethod}');
+    }
+    return buffer.toString();
+  }
+
+  Future<void> _syncAccountingEntryCreate(AccountingEntry entry) async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    try {
+      await ApiClient(backendUrl).createAccountingEntry(
+          orgId, assignedBranchId ?? currentBranch?.id ?? '', deviceUid, entry);
+      syncStatus = 'Accounting entry synced.';
+    } catch (error) {
+      syncStatus = 'Accounting entry saved locally: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> deleteAccountingEntry(AccountingEntry entry) async {
+    if (_busyDepth == 0) {
+      return runBusy(
+          'Deleting accounting entry...', () => deleteAccountingEntry(entry));
+    }
+    accountingEntries.removeWhere((item) => item.id == entry.id);
+    await save();
+    notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncAccountingEntryDelete(entry.id));
+    }
+  }
+
+  Future<void> _syncAccountingEntryDelete(String entryId) async {
+    try {
+      await ApiClient(backendUrl).deleteAccountingEntry(deviceUid, entryId);
+      syncStatus = 'Accounting entry deleted from cloud.';
+    } catch (error) {
+      syncStatus = 'Accounting entry deleted locally: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> deleteAllAccountingEntries({required bool allBranches}) async {
+    if (_busyDepth == 0) {
+      return runBusy('Deleting accounting entries...',
+          () => deleteAllAccountingEntries(allBranches: allBranches));
+    }
+    final branchId = assignedBranchId;
+    final deleteIds = accountingEntries
+        .where((entry) =>
+            allBranches || branchId == null || entry.branchId == branchId)
+        .map((entry) => entry.id)
+        .toSet();
+    accountingEntries.removeWhere((entry) => deleteIds.contains(entry.id));
+    syncStatus = allBranches
+        ? 'All accounting entries deleted locally.'
+        : 'This branch accounting entries deleted locally.';
+    await save();
+    notifyListeners();
+    if (organizationId != null && deleteIds.isNotEmpty) {
+      unawaited(_syncAccountingEntryBulkDelete(deleteIds.toList()));
+    }
+  }
+
+  Future<void> _syncAccountingEntryBulkDelete(List<String> entryIds) async {
+    try {
+      final api = ApiClient(backendUrl);
+      for (final entryId in entryIds) {
+        await api.deleteAccountingEntry(deviceUid, entryId);
+      }
+      syncStatus = 'Accounting entries deleted from cloud.';
+    } catch (error) {
+      syncStatus = 'Accounting entries deleted locally: $error';
+    }
+    await save();
+    notifyListeners();
   }
 
   String backupText() {
     final buffer = StringBuffer()
-      ..writeln('Light Winter RetailOS Backup Manifest')
+      ..writeln('Light Winter RetailOS Recovery Summary')
       ..writeln('Shop: ${company?.shopName ?? ''}')
       ..writeln('Device: $deviceUid')
       ..writeln('Owner recovery code: $recoveryCode')
@@ -612,7 +1698,7 @@ Each device still needs its own Light Winter Technologies license voucher after 
       ..writeln('Synced branch stock tables: ${branchStockSnapshots.length}')
       ..writeln('')
       ..writeln(
-          'This backup covers local cached operating data. Supabase remains the shared cloud database for all synced devices and branches.');
+          'This recovery summary covers local cached operating data. Supabase remains the shared cloud database for all synced devices and branches.');
     return buffer.toString();
   }
 
@@ -648,15 +1734,23 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     exchangeRates = {...exchangeRates, ...rates};
     displayCurrency = currency;
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final data = await ApiClient(backendUrl).updateExchangeRates(
-            organizationId!, deviceUid, exchangeRates, displayCurrency);
-        _applyBootstrap(data);
-        syncStatus = 'Exchange rates synced to all devices.';
-      } catch (error) {
-        syncStatus = 'Exchange rates saved locally: $error';
-      }
+      unawaited(_syncExchangeRates());
+    }
+  }
+
+  Future<void> _syncExchangeRates() async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    try {
+      final data = await ApiClient(backendUrl).updateExchangeRates(
+          orgId, deviceUid, exchangeRates, displayCurrency);
+      _applyBootstrap(data);
+      syncStatus = 'Exchange rates synced to all devices.';
+    } catch (error) {
+      syncStatus = 'Exchange rates saved locally: $error';
     }
     await save();
     notifyListeners();
@@ -766,6 +1860,11 @@ Each device still needs its own Light Winter Technologies license voucher after 
     saleVoids = ((data['saleVoids'] ?? []) as List)
         .map((item) => SaleVoidRecord.fromJson(Map<String, dynamic>.from(item)))
         .toList();
+    accountingEntries = ((data['accountingEntries'] ?? []) as List)
+        .map(
+            (item) => AccountingEntry.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+    pendingSaleSyncIds = Set<String>.from(data['pendingSaleSyncIds'] ?? []);
     _migrateLegacyBranchStockIfNeeded();
     if (assignedBranchId != null) _restoreBranchSnapshot(assignedBranchId!);
     suppliers = ((data['suppliers'] ?? []) as List)
@@ -795,6 +1894,12 @@ Each device still needs its own Light Winter Technologies license voucher after 
     nextCustomerNumber = data['nextCustomerNumber'] ?? nextCustomerNumber;
     _ensureCustomerCounterDay();
     displayCurrency = data['displayCurrency'] ?? displayCurrency;
+    if (data['posCurrency'] == null) {
+      posCurrency = displayCurrency;
+      displayCurrency = 'USD';
+    } else {
+      posCurrency = data['posCurrency'] ?? posCurrency;
+    }
     allCatalogueProductsVisible =
         data['allCatalogueProductsVisible'] ?? allCatalogueProductsVisible;
     exchangeRates = {
@@ -825,18 +1930,27 @@ Each device still needs its own Light Winter Technologies license voucher after 
       ..reset()
       ..start();
     restoreOrExpireSession(notify: false);
-    if (company != null &&
-        organizationId != null &&
-        isSupabaseUrl(backendUrl)) {
-      try {
-        final cloud = await ApiClient(backendUrl).bootstrap(deviceUid);
-        _applyBootstrap(cloud);
-        syncStatus = 'Cloud license checkpoint loaded.';
-      } catch (_) {
-        // Offline startup keeps the last trusted checkpoint and local state.
-      }
+  }
+
+  void refreshStartupCloudInBackground() {
+    if (!isSupabaseUrl(backendUrl) || deviceUid.trim().isEmpty) return;
+    unawaited(_refreshStartupCloud());
+  }
+
+  Future<void> _refreshStartupCloud() async {
+    if (_syncInProgress) return;
+    _syncInProgress = true;
+    try {
+      final cloud = await ApiClient(backendUrl).bootstrap(deviceUid);
+      _applyBootstrap(cloud);
+      syncStatus = 'Cloud license checkpoint loaded.';
+      await save();
+      notifyListeners();
+    } catch (_) {
+      // Startup must stay instant; login/manual sync handles visible errors.
+    } finally {
+      _syncInProgress = false;
     }
-    await save();
   }
 
   Future<void> save() async {
@@ -864,6 +1978,9 @@ Each device still needs its own Light Winter Technologies license voucher after 
         'branchStockInitialized': branchStockInitialized.toList(),
         'stockTransfers': stockTransfers.map((item) => item.toJson()).toList(),
         'saleVoids': saleVoids.map((item) => item.toJson()).toList(),
+        'accountingEntries':
+            accountingEntries.map((item) => item.toJson()).toList(),
+        'pendingSaleSyncIds': pendingSaleSyncIds.toList(),
         'suppliers': suppliers.map((item) => item.toJson()).toList(),
         'customers': customers.map((item) => item.toJson()).toList(),
         'sales': sales.map((item) => item.toJson()).toList(),
@@ -873,6 +1990,7 @@ Each device still needs its own Light Winter Technologies license voucher after 
         'customerCounterDate': customerCounterDate,
         'nextCustomerNumber': nextCustomerNumber,
         'displayCurrency': displayCurrency,
+        'posCurrency': posCurrency,
         'allCatalogueProductsVisible': allCatalogueProductsVisible,
         'exchangeRates': exchangeRates,
         'fiscalDayNo': fiscalDayNo,
@@ -997,24 +2115,10 @@ Each device still needs its own Light Winter Technologies license voucher after 
           branchIds:
               draft.branchIds.isEmpty ? [firstBranch.id] : draft.branchIds));
     }
-    products = [
-      Product(
-          id: newId(),
-          name: 'Bread',
-          sku: 'BREAD',
-          barcode: '1001',
-          priceCents: 110,
-          stock: 20,
-          reorderLevel: 5),
-      Product(
-          id: newId(),
-          name: 'Mazoe Orange 2L',
-          sku: 'MAZOE-2L',
-          barcode: '1002',
-          priceCents: 250,
-          stock: 12,
-          reorderLevel: 4),
-    ];
+    products = [];
+    suppliers = [];
+    branchStockSnapshots = {firstBranch.id: {}};
+    branchStockInitialized = {firstBranch.id};
     try {
       final data = await ApiClient(backendUrl).createShop(
         shopName: shopName,
@@ -1138,6 +2242,40 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
   }
 
+  Future<void> recoverCurrentDeviceFromCloud() async {
+    if (_busyDepth == 0) {
+      return runBusy(
+          'Recovering this device...', recoverCurrentDeviceFromCloud);
+    }
+    await useBuiltInCloudSettings();
+    final data = await ApiClient(backendUrl).bootstrap(deviceUid);
+    _applyBootstrap(data);
+    syncStatus = 'Device recovered from cloud.';
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> recoverPreviousDeviceIdFromCloud(
+      String previousDeviceUid) async {
+    final cleanUid = previousDeviceUid.trim().toUpperCase();
+    if (!RegExp(r'^LWR-[0-9A-Z]{3,}$').hasMatch(cleanUid)) {
+      throw StateError(
+          'Enter the old Device ID exactly, for example LWR-123456.');
+    }
+    if (_busyDepth == 0) {
+      return runBusy('Recovering previous device ID...',
+          () => recoverPreviousDeviceIdFromCloud(cleanUid));
+    }
+    await useBuiltInCloudSettings();
+    final data = await ApiClient(backendUrl).bootstrap(cleanUid);
+    deviceUid = cleanUid;
+    _applyBootstrap(data);
+    syncStatus =
+        'Previous Device ID restored. This device is now using $cleanUid.';
+    await save();
+    notifyListeners();
+  }
+
   Future<Map<String, dynamic>> resetOwnerAccess({
     required String recoveryCode,
     required String resetVoucher,
@@ -1161,7 +2299,15 @@ Each device still needs its own Light Winter Technologies license voucher after 
 
   Future<void> syncNow() async {
     if (_busyDepth == 0) return runBusy('Syncing cloud data...', syncNow);
+    if (_manualSyncInProgress || _syncInProgress) {
+      syncStatus = 'Sync already running. Stock is safe.';
+      await save();
+      notifyListeners();
+      return;
+    }
+    _manualSyncInProgress = true;
     try {
+      await _retryPendingSales();
       final data = await ApiClient(backendUrl).bootstrap(deviceUid);
       _applyBootstrap(data);
       syncStatus = 'Synced ${DateTime.now().toLocal()}';
@@ -1176,6 +2322,8 @@ Each device still needs its own Light Winter Technologies license voucher after 
       }
       syncStatus = 'Sync failed: $message';
       rethrow;
+    } finally {
+      _manualSyncInProgress = false;
     }
     await save();
     notifyListeners();
@@ -1189,8 +2337,15 @@ Each device still needs its own Light Winter Technologies license voucher after 
         currentUser == null) {
       return;
     }
+    final now = DateTime.now();
+    if (_lastSilentSyncAt != null &&
+        now.difference(_lastSilentSyncAt!) < const Duration(minutes: 15)) {
+      return;
+    }
+    _lastSilentSyncAt = now;
     _syncInProgress = true;
     try {
+      await _retryPendingSales();
       final data = await ApiClient(backendUrl).bootstrap(deviceUid);
       _applyBootstrap(data);
       syncStatus = 'Synced ${DateTime.now().toLocal()}';
@@ -1200,6 +2355,49 @@ Each device still needs its own Light Winter Technologies license voucher after 
       // Keep offline-first use smooth for network errors; login/manual sync handles lockout errors.
     } finally {
       _syncInProgress = false;
+    }
+  }
+
+  Future<void> _retryPendingSales() async {
+    if (pendingSaleSyncIds.isEmpty) return;
+    final pendingIds = pendingSaleSyncIds.toList();
+    for (final saleId in pendingIds) {
+      final sale = sales.where((item) => item.id == saleId).firstOrNull;
+      if (sale == null) {
+        pendingSaleSyncIds.remove(saleId);
+        continue;
+      }
+      final saleLines = sale.lines
+          .map((line) => CartItem(
+              product: Product(
+                id: line.productId,
+                name: line.name,
+                sku: '',
+                barcode: '',
+                priceCents: line.unitPriceCents,
+                costCents: line.unitCostCents,
+                stock: line.quantity,
+                reorderLevel: 0,
+                isCustom: line.productId.startsWith('CUSTOM-'),
+              ),
+              quantity: line.quantity))
+          .toList();
+      final customerId = sale.customerName.trim().isEmpty
+          ? null
+          : customers
+              .where((customer) =>
+                  customer.name.toLowerCase() ==
+                  sale.customerName.toLowerCase())
+              .firstOrNull
+              ?.id;
+      await ApiClient(backendUrl).createSale(deviceUid, currentUser?.id,
+          customerId, sale.paymentMethod, saleLines, sale.totalCents,
+          saleId: sale.id,
+          discountCents: sale.discountCents,
+          paidCents: sale.paidCents,
+          changeCents: sale.changeCents,
+          debtCents: sale.debtCents);
+      pendingSaleSyncIds.remove(saleId);
     }
   }
 
@@ -1218,6 +2416,12 @@ Each device still needs its own Light Winter Technologies license voucher after 
   }
 
   void _applyBootstrap(Map<String, dynamic> data) {
+    final previousAssignedBranchId = assignedBranchId;
+    final localCurrentBranchStockBeforeBootstrap =
+        previousAssignedBranchId == null
+            ? <String, int>{}
+            : Map<String, int>.from(
+                branchStockSnapshots[previousAssignedBranchId] ?? const {});
     organizationId = data['organization_id'];
     backendDeviceId = data['device_id'];
     deviceActive = data['device_active'] ?? true;
@@ -1276,32 +2480,70 @@ Each device still needs its own Light Winter Technologies license voucher after 
       }
     }
     final localProductsBeforeBootstrap = [...products];
+    final localCustomersBeforeBootstrap = [...customers];
+    final localSuppliersBeforeBootstrap = [...suppliers];
+    final localTransfersBeforeBootstrap = [...stockTransfers];
+    final localVoidsBeforeBootstrap = [...saleVoids];
+    final localAccountingBeforeBootstrap = [...accountingEntries];
+    final localSalesBeforeBootstrap = [...sales];
+    final localProductStockBeforeBootstrap = {
+      for (final product in localProductsBeforeBootstrap)
+        product.id: max(product.stock,
+            localCurrentBranchStockBeforeBootstrap[product.id] ?? 0)
+    };
     final stockItems = ((data['stock'] ?? []) as List);
-    final currentStockRows = {
+    final currentStockRows = <String, int>{
       for (final item in stockItems)
         if ('${item['branch_id']}' == assignedBranchId)
-          item['product_id']: item['quantity'] ?? 0
+          '${item['product_id']}': item['quantity'] ?? 0
     };
-    final incomingProducts = ((data['products'] ?? []) as List)
-        .map((item) => Product.fromApi(item, currentStockRows[item['id']] ?? 0))
-        .toList();
-    if (incomingProducts.length >= localProductsBeforeBootstrap.length) {
-      products = incomingProducts;
-    } else {
-      final mergedById = {
-        for (final product in localProductsBeforeBootstrap) product.id: product
-      };
-      for (final product in incomingProducts) {
-        mergedById[product.id] = product;
+    final currentBranchCloudHasPositiveStock =
+        currentStockRows.values.any((quantity) => quantity > 0);
+    if (!currentBranchCloudHasPositiveStock) {
+      for (final entry in localProductStockBeforeBootstrap.entries) {
+        if (entry.value <= 0) continue;
+        currentStockRows[entry.key] =
+            max(currentStockRows[entry.key] ?? 0, entry.value);
       }
-      products = mergedById.values.toList()
-        ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
-      syncStatus =
-          'Cloud sync kept local catalogue because the server returned fewer products.';
     }
-    customers = ((data['customers'] ?? []) as List)
+    int localStockForIncomingProduct(Map<String, dynamic> item) {
+      final id = '${item['id'] ?? ''}';
+      return localProductStockBeforeBootstrap[id] ?? 0;
+    }
+
+    final incomingProducts = ((data['products'] ?? []) as List)
+        .map((item) => Product.fromApi(
+            item,
+            max(currentStockRows['${item['id']}'] ?? 0,
+                localStockForIncomingProduct(Map<String, dynamic>.from(item)))))
+        .toList();
+    final incomingProductIds = incomingProducts.map((item) => item.id).toSet();
+    final mergedById = {
+      for (final product in incomingProducts) product.id: product
+    };
+    for (final localProduct in localProductsBeforeBootstrap) {
+      if (incomingProductIds.contains(localProduct.id)) continue;
+      final localStock = localProductStockBeforeBootstrap[localProduct.id] ?? 0;
+      if (localStock > 0 ||
+          branchStockSnapshots.values
+              .any((snapshot) => snapshot.containsKey(localProduct.id))) {
+        mergedById[localProduct.id] = localProduct;
+      }
+    }
+    products = mergedById.values.toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    final incomingCustomers = ((data['customers'] ?? []) as List)
         .map((item) => Customer.fromApi(item))
         .toList();
+    customers = mergeById<Customer>(
+        localCustomersBeforeBootstrap, incomingCustomers, (item) => item.id);
+    if (data['suppliers'] != null) {
+      final incomingSuppliers = ((data['suppliers'] ?? []) as List)
+          .map((item) => Supplier.fromApi(Map<String, dynamic>.from(item)))
+          .toList();
+      suppliers = mergeById<Supplier>(
+          localSuppliersBeforeBootstrap, incomingSuppliers, (item) => item.id);
+    }
     if (data['exchange_rates'] != null) {
       exchangeRates = {
         ...exchangeRates,
@@ -1311,18 +2553,34 @@ Each device still needs its own Light Winter Technologies license voucher after 
       };
     }
     displayCurrency = data['display_currency'] ?? displayCurrency;
-    stockTransfers = ((data['stock_transfers'] ?? []) as List)
+    final incomingTransfers = ((data['stock_transfers'] ?? []) as List)
         .map((item) =>
             StockTransferRecord.fromApi(Map<String, dynamic>.from(item)))
-        .toList()
-        .ifEmpty(stockTransfers);
-    saleVoids = ((data['sale_voids'] ?? []) as List)
+        .toList();
+    stockTransfers = mergeById<StockTransferRecord>(
+        localTransfersBeforeBootstrap, incomingTransfers, (item) => item.id)
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    final incomingVoids = ((data['sale_voids'] ?? []) as List)
         .map((item) => SaleVoidRecord.fromApi(Map<String, dynamic>.from(item)))
-        .toList()
-        .ifEmpty(saleVoids);
-    sales = ((data['sales'] ?? []) as List)
+        .toList();
+    saleVoids = mergeById<SaleVoidRecord>(
+        localVoidsBeforeBootstrap, incomingVoids, (item) => item.id)
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    final incomingAccounting = ((data['accounting_entries'] ?? []) as List)
+        .map(
+            (item) => AccountingEntry.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+    accountingEntries = mergeById<AccountingEntry>(
+        localAccountingBeforeBootstrap, incomingAccounting, (item) => item.id)
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    final incomingSales = ((data['sales'] ?? []) as List)
         .map((item) => SaleRecord.fromApi(item))
         .toList();
+    final cloudSaleIds = incomingSales.map((sale) => sale.id).toSet();
+    pendingSaleSyncIds.removeWhere(cloudSaleIds.contains);
+    sales = mergeById<SaleRecord>(
+        localSalesBeforeBootstrap, incomingSales, (item) => item.id)
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
     final salesByBranch = <String, List<SaleRecord>>{};
     for (final sale in sales) {
       if (sale.branchId.isEmpty) continue;
@@ -1331,16 +2589,66 @@ Each device still needs its own Light Winter Technologies license voucher after 
     for (final entry in salesByBranch.entries) {
       branchSaleSnapshots[entry.key] = entry.value;
     }
+    final activeProductIds = products.map((product) => product.id).toSet();
     final stockByBranch = <String, Map<String, int>>{};
+    final branchProductActivity = <String, Set<String>>{};
+    void markBranchProductActivity(String branchId, String productId) {
+      if (branchId.trim().isEmpty || productId.trim().isEmpty) return;
+      branchProductActivity
+          .putIfAbsent(branchId, () => <String>{})
+          .add(productId);
+    }
+
+    for (final sale in sales) {
+      for (final line in sale.lines) {
+        markBranchProductActivity(sale.branchId, line.productId);
+      }
+    }
+    for (final transfer in stockTransfers) {
+      markBranchProductActivity(transfer.fromBranchId, transfer.productId);
+      markBranchProductActivity(transfer.toBranchId, transfer.productId);
+    }
+    for (final entry
+        in accountingEntries.where((entry) => entry.isStockPurchase)) {
+      final productName = entry.batchProductName.trim().toLowerCase();
+      if (productName.isEmpty) continue;
+      final product = products
+          .where((item) => item.name.trim().toLowerCase() == productName)
+          .firstOrNull;
+      if (product != null) {
+        markBranchProductActivity(entry.branchId, product.id);
+      }
+    }
     for (final item in stockItems) {
       final branchId = '${item['branch_id']}';
       final productId = '${item['product_id']}';
+      if (!activeProductIds.contains(productId)) continue;
       final quantity = item['quantity'] ?? 0;
       stockByBranch.putIfAbsent(branchId, () => {})[productId] = quantity;
     }
+    if (assignedBranchId != null &&
+        !currentBranchCloudHasPositiveStock &&
+        localProductStockBeforeBootstrap.values
+            .any((quantity) => quantity > 0)) {
+      final canonicalLocalStock = <String, int>{};
+      for (final product in products) {
+        final stock = localProductStockBeforeBootstrap[product.id] ?? 0;
+        if (stock > 0) canonicalLocalStock[product.id] = stock;
+      }
+      stockByBranch[assignedBranchId!] = {
+        ...?stockByBranch[assignedBranchId!],
+        for (final entry in canonicalLocalStock.entries)
+          if (entry.value > 0)
+            entry.key: max(
+                stockByBranch[assignedBranchId!]?[entry.key] ?? 0, entry.value)
+      };
+    }
     for (final branch in branches) {
-      if (stockByBranch.containsKey(branch.id)) {
-        branchStockSnapshots[branch.id] = stockByBranch[branch.id]!;
+      final cleanSnapshot = stockByBranch[branch.id] ?? <String, int>{};
+      branchStockSnapshots[branch.id] = cleanSnapshot;
+      if (cleanSnapshot.isEmpty) {
+        branchStockInitialized.remove(branch.id);
+      } else {
         branchStockInitialized.add(branch.id);
       }
     }
@@ -1354,17 +2662,12 @@ Each device still needs its own Light Winter Technologies license voucher after 
           currentUser;
     }
     if (assignedBranchId != null) {
-      if (incomingProducts.length >= localProductsBeforeBootstrap.length ||
-          !branchStockSnapshots.containsKey(assignedBranchId!)) {
+      if (stockByBranch.containsKey(assignedBranchId!)) {
         branchStockSnapshots[assignedBranchId!] =
-            stockByBranch[assignedBranchId!] ??
-                {for (final product in products) product.id: product.stock};
-      }
-      if (stockItems.isNotEmpty ||
-          products.any((product) => product.stock > 0)) {
+            stockByBranch[assignedBranchId!]!;
         branchStockInitialized.add(assignedBranchId!);
-      } else {
-        branchStockInitialized.remove(assignedBranchId!);
+      } else if (!branchStockSnapshots.containsKey(assignedBranchId!)) {
+        branchStockSnapshots[assignedBranchId!] = <String, int>{};
       }
       sales = [...(branchSaleSnapshots[assignedBranchId!] ?? sales)];
       _restoreBranchSnapshot(assignedBranchId!);
@@ -1397,16 +2700,24 @@ Each device still needs its own Light Winter Technologies license voucher after 
   void _captureCurrentBranchSnapshot({bool force = false}) {
     final branchId = assignedBranchId;
     if (branchId == null) return;
-    final hasStock = products.any((product) => product.stock > 0);
-    if (!force && !branchStockInitialized.contains(branchId) && !hasStock) {
+    final existing = branchStockSnapshots[branchId] ?? const <String, int>{};
+    final branchWasInitialized =
+        branchStockInitialized.contains(branchId) || existing.isNotEmpty;
+    final snapshot = <String, int>{};
+    for (final product in products) {
+      final previousAssigned = existing.containsKey(product.id);
+      if (previousAssigned || (!branchWasInitialized && product.stock > 0)) {
+        snapshot[product.id] = product.stock;
+      }
+    }
+    final hasStock = snapshot.values.any((quantity) => quantity > 0);
+    if (!force && existing.isEmpty && !hasStock) {
       branchStockSnapshots.remove(branchId);
       branchSaleSnapshots[branchId] = [...sales];
       return;
     }
-    branchStockSnapshots[branchId] = {
-      for (final product in products) product.id: product.stock
-    };
-    if (force || hasStock) {
+    branchStockSnapshots[branchId] = snapshot;
+    if (force || snapshot.isNotEmpty || hasStock) {
       branchStockInitialized.add(branchId);
     }
     branchSaleSnapshots[branchId] = [...sales];
@@ -1417,6 +2728,14 @@ Each device still needs its own Light Winter Technologies license voucher after 
     if (branchId == null) return;
     branchStockInitialized.add(branchId);
     _captureCurrentBranchSnapshot(force: true);
+  }
+
+  void _assignProductToCurrentBranch(Product product, {int? quantity}) {
+    final branchId = assignedBranchId;
+    if (branchId == null) return;
+    final snapshot = branchStockSnapshots.putIfAbsent(branchId, () => {});
+    snapshot[product.id] = quantity ?? product.stock;
+    branchStockInitialized.add(branchId);
   }
 
   void _markBranchStockInitialized(String branchId, Map<String, int> snapshot) {
@@ -1442,57 +2761,76 @@ Each device still needs its own Light Winter Technologies license voucher after 
   }
 
   Future<bool> login(String username, String pin) async {
-    return runBusy('Checking login...', () async {
-      lastLoginError = 'Username or PIN is incorrect.';
-      if (!deviceActive) {
-        lastLoginError = deviceLockMessage.isEmpty
-            ? 'This device has been deactivated. Contact Light Winter Technologies.'
-            : deviceLockMessage;
-        return false;
-      }
-      if (users.isEmpty) return false;
-      final normalized = username.trim().toLowerCase();
-      var user = users
-          .where((item) =>
-              item.username.toLowerCase() == normalized && item.pin == pin)
-          .firstOrNull;
-      if (user == null) return false;
+    lastLoginError = 'Username or PIN is incorrect.';
+    if (!deviceActive) {
+      lastLoginError = deviceLockMessage.isEmpty
+          ? 'This device has been deactivated. Contact Light Winter Technologies.'
+          : deviceLockMessage;
+      return false;
+    }
+    if (users.isEmpty) return false;
+    final normalized = username.trim().toLowerCase();
+    var user = users
+        .where((item) =>
+            item.username.toLowerCase() == normalized && item.pin == pin)
+        .firstOrNull;
+    if (user == null) return false;
+    if (!user.canLoginAtBranch(assignedBranchId)) {
+      lastLoginError =
+          '${user.name} is not assigned to ${currentBranch?.name ?? 'this branch'}. Ask the owner to edit branch access.';
+      return false;
+    }
+    currentUser = user;
+    sessionUsername = user.username;
+    sessionLastSeenAt = DateTime.now().toUtc();
+    unawaited(save());
+    notifyListeners();
+    if (Platform.isWindows && isSupabaseUrl(backendUrl)) {
       try {
-        if (isSupabaseUrl(backendUrl)) {
-          final data = await ApiClient(backendUrl).bootstrap(deviceUid);
-          _applyBootstrap(data);
-          user = users
-              .where((item) =>
-                  item.username.toLowerCase() == normalized && item.pin == pin)
-              .firstOrNull;
-        }
-      } catch (error) {
-        final message = cleanError(error);
-        syncStatus = 'License refresh failed: $message';
-        if (message.toLowerCase().contains('deactivated') ||
-            message.toLowerCase().contains('not activated')) {
-          deviceActive = false;
-          deviceLockMessage =
-              'This device has been deactivated. Contact Light Winter Technologies.';
-          lastLoginError = deviceLockMessage;
-          await save();
-          notifyListeners();
-          return false;
-        }
+        await _refreshLoginCloud(normalized, pin)
+            .timeout(const Duration(seconds: 4));
+      } catch (_) {
+        // Keep local login available; the startup/manual sync path will refresh
+        // the trusted license checkpoint when the connection is available.
       }
-      if (user == null) return false;
-      if (!user.canLoginAtBranch(assignedBranchId)) {
-        lastLoginError =
-            '${user.name} is not assigned to ${currentBranch?.name ?? 'this branch'}. Ask the owner to edit branch access.';
-        return false;
+    } else {
+      unawaited(_refreshLoginCloud(normalized, pin));
+    }
+    return true;
+  }
+
+  Future<void> _refreshLoginCloud(String normalizedUsername, String pin) async {
+    if (!isSupabaseUrl(backendUrl)) return;
+    try {
+      final data = await ApiClient(backendUrl).bootstrap(deviceUid);
+      _applyBootstrap(data);
+      final user = users
+          .where((item) =>
+              item.username.toLowerCase() == normalizedUsername &&
+              item.pin == pin)
+          .firstOrNull;
+      if (user != null && user.canLoginAtBranch(assignedBranchId)) {
+        currentUser = user;
+        sessionUsername = user.username;
+        sessionLastSeenAt = DateTime.now().toUtc();
       }
-      currentUser = user;
-      sessionUsername = user.username;
-      sessionLastSeenAt = DateTime.now().toUtc();
       await save();
       notifyListeners();
-      return true;
-    });
+    } catch (error) {
+      final message = cleanError(error);
+      syncStatus = 'Cloud refresh failed: $message';
+      if (message.toLowerCase().contains('deactivated') ||
+          message.toLowerCase().contains('not activated')) {
+        deviceActive = false;
+        deviceLockMessage =
+            'This device has been deactivated. Contact Light Winter Technologies.';
+        currentUser = null;
+        sessionUsername = null;
+        sessionLastSeenAt = null;
+      }
+      await save();
+      notifyListeners();
+    }
   }
 
   void logout() {
@@ -1513,8 +2851,10 @@ Each device still needs its own Light Winter Technologies license voucher after 
 
   void restoreOrExpireSession({bool notify = true}) {
     if (sessionUsername == null || sessionLastSeenAt == null) return;
-    final elapsed = DateTime.now().toUtc().difference(sessionLastSeenAt!);
-    if (elapsed > sessionGracePeriod) {
+    final shouldExpireSession = !Platform.isWindows &&
+        DateTime.now().toUtc().difference(sessionLastSeenAt!) >
+            sessionGracePeriod;
+    if (shouldExpireSession) {
       currentUser = null;
       sessionUsername = null;
       sessionLastSeenAt = null;
@@ -1543,15 +2883,23 @@ Each device still needs its own Light Winter Technologies license voucher after 
       return runBusy('Saving company profile...', () => saveCompany(updated));
     }
     company = updated;
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final data = await ApiClient(backendUrl)
-            .updateCompany(organizationId!, deviceUid, updated);
-        _applyBootstrap(data);
-        syncStatus = 'Company and fiscal settings synced.';
-      } catch (error) {
-        syncStatus = 'Company settings saved locally: $error';
-      }
+      unawaited(_syncCompany(updated));
+    }
+  }
+
+  Future<void> _syncCompany(Company updated) async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    try {
+      final data =
+          await ApiClient(backendUrl).updateCompany(orgId, deviceUid, updated);
+      _applyBootstrap(data);
+      syncStatus = 'Company and fiscal settings synced.';
+    } catch (error) {
+      syncStatus = 'Company settings saved locally: $error';
     }
     await save();
     notifyListeners();
@@ -1581,14 +2929,24 @@ Each device still needs its own Light Winter Technologies license voucher after 
         pin: pin,
         permissions: permissions,
         branchIds: role == 'Owner' ? [] : branchIds));
+    final created = users.last;
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final data = await ApiClient(backendUrl)
-            .createUser(organizationId!, deviceUid, users.last);
-        _applyBootstrap(data);
-      } catch (error) {
-        syncStatus = 'User queued locally: $error';
-      }
+      unawaited(_syncUserCreate(created));
+    }
+  }
+
+  Future<void> _syncUserCreate(AppUser user) async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    try {
+      final data =
+          await ApiClient(backendUrl).createUser(orgId, deviceUid, user);
+      _applyBootstrap(data);
+      syncStatus = 'User synced.';
+    } catch (error) {
+      syncStatus = 'User queued locally: $error';
     }
     await save();
     notifyListeners();
@@ -1616,14 +2974,22 @@ Each device still needs its own Light Winter Technologies license voucher after 
     user.pin = draft.pin;
     user.permissions = draft.permissions;
     user.branchIds = user.isOwner ? [] : draft.branchIds;
+    await save();
+    notifyListeners();
     if (user.id != null) {
-      try {
-        final data =
-            await ApiClient(backendUrl).updateUser(user.id!, deviceUid, user);
-        _applyBootstrap(data);
-      } catch (error) {
-        syncStatus = 'User update local only: $error';
-      }
+      unawaited(_syncUserUpdate(user));
+    }
+  }
+
+  Future<void> _syncUserUpdate(AppUser user) async {
+    if (user.id == null) return;
+    try {
+      final data =
+          await ApiClient(backendUrl).updateUser(user.id!, deviceUid, user);
+      _applyBootstrap(data);
+      syncStatus = 'User synced.';
+    } catch (error) {
+      syncStatus = 'User update local only: $error';
     }
     await save();
     notifyListeners();
@@ -1641,14 +3007,20 @@ Each device still needs its own Light Winter Technologies license voucher after 
       throw StateError('At least one user must keep all privileges.');
     }
     users.remove(user);
+    await save();
+    notifyListeners();
     if (user.id != null) {
-      try {
-        final data =
-            await ApiClient(backendUrl).deleteUser(user.id!, deviceUid);
-        _applyBootstrap(data);
-      } catch (error) {
-        syncStatus = 'User delete local only: $error';
-      }
+      unawaited(_syncUserDelete(user.id!));
+    }
+  }
+
+  Future<void> _syncUserDelete(String userId) async {
+    try {
+      final data = await ApiClient(backendUrl).deleteUser(userId, deviceUid);
+      _applyBootstrap(data);
+      syncStatus = 'User deleted from cloud.';
+    } catch (error) {
+      syncStatus = 'User delete local only: $error';
     }
     await save();
     notifyListeners();
@@ -1663,15 +3035,25 @@ Each device still needs its own Light Winter Technologies license voucher after 
         name: draft.name,
         address: draft.address,
         phone: draft.phone));
+    final created = branches.last;
     assignedBranchId ??= branches.first.id;
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final data = await ApiClient(backendUrl)
-            .createBranch(organizationId!, deviceUid, draft);
-        _applyBootstrap(data);
-      } catch (error) {
-        syncStatus = 'Branch queued locally: $error';
-      }
+      unawaited(_syncBranchCreate(created, draft));
+    }
+  }
+
+  Future<void> _syncBranchCreate(BranchProfile local, BranchDraft draft) async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    try {
+      final data =
+          await ApiClient(backendUrl).createBranch(orgId, deviceUid, draft);
+      _applyBootstrap(data);
+      syncStatus = '${local.name} branch synced.';
+    } catch (error) {
+      syncStatus = 'Branch queued locally: $error';
     }
     await save();
     notifyListeners();
@@ -1687,10 +3069,17 @@ Each device still needs its own Light Winter Technologies license voucher after 
     if (branch.id == assignedBranchId && company != null) {
       company!.branchName = branch.name;
     }
+    await save();
+    notifyListeners();
+    unawaited(_syncBranchUpdate(branch.id, draft));
+  }
+
+  Future<void> _syncBranchUpdate(String branchId, BranchDraft draft) async {
     try {
       final data =
-          await ApiClient(backendUrl).updateBranch(branch.id, deviceUid, draft);
+          await ApiClient(backendUrl).updateBranch(branchId, deviceUid, draft);
       _applyBootstrap(data);
+      syncStatus = 'Branch synced.';
     } catch (error) {
       syncStatus = 'Branch update local only: $error';
     }
@@ -1709,10 +3098,17 @@ Each device still needs its own Light Winter Technologies license voucher after 
     if (assignedBranchId == branch.id) {
       assignedBranchId = branches.first.id;
     }
+    await save();
+    notifyListeners();
+    unawaited(_syncBranchDelete(branch.id));
+  }
+
+  Future<void> _syncBranchDelete(String branchId) async {
     try {
       final data =
-          await ApiClient(backendUrl).deleteBranch(branch.id, deviceUid);
+          await ApiClient(backendUrl).deleteBranch(branchId, deviceUid);
       _applyBootstrap(data);
+      syncStatus = 'Branch deleted from cloud.';
     } catch (error) {
       syncStatus = 'Branch delete local only: $error';
     }
@@ -1724,10 +3120,22 @@ Each device still needs its own Light Winter Technologies license voucher after 
     if (_busyDepth == 0) {
       return runBusy('Switching branch...', () => assignDeviceToBranch(branch));
     }
+    final user = currentUser;
+    if (user != null && !user.canLoginAtBranch(branch.id)) {
+      throw StateError(
+          '${user.name} is not assigned to ${branch.name}. Ask the owner to edit branch access.');
+    }
     _captureCurrentBranchSnapshot();
     _clearBranchWorkingSession();
     assignedBranchId = branch.id;
     if (company != null) company!.branchName = branch.name;
+    _restoreBranchSnapshot(branch.id);
+    await save();
+    notifyListeners();
+    unawaited(_syncBranchView(branch));
+  }
+
+  Future<void> _syncBranchView(BranchProfile branch) async {
     try {
       final data =
           await ApiClient(backendUrl).loadBranchView(deviceUid, branch.id);
@@ -1735,7 +3143,6 @@ Each device still needs its own Light Winter Technologies license voucher after 
       _clearBranchWorkingSession();
       syncStatus = 'Loaded branch session for ${branch.name}.';
     } catch (error) {
-      _restoreBranchSnapshot(branch.id);
       syncStatus = 'Branch switched with local snapshot: $error';
     }
     await save();
@@ -1783,21 +3190,16 @@ Each device still needs its own Light Winter Technologies license voucher after 
     if (stockTransfers.length > 100) {
       stockTransfers = stockTransfers.take(100).toList();
     }
-    if (organizationId != null) {
-      try {
-        final data = await ApiClient(backendUrl).transferStock(
-            deviceUid, sourceBranchId, targetBranch.id, product.id, quantity,
-            productName: product.name,
-            userName: currentUser?.name ?? currentUser?.username ?? 'User');
-        _applyBootstrap(data);
-        syncStatus =
-            'Transferred $quantity ${product.name} to ${targetBranch.name}.';
-      } catch (error) {
-        syncStatus = 'Transfer queued locally: $error';
-      }
-    }
     await save();
     notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncStockTransfer(
+          sourceBranchId,
+          targetBranch.id,
+          product,
+          quantity,
+          'Transferred $quantity ${product.name} to ${targetBranch.name}.'));
+    }
   }
 
   Future<void> transferStockBetweenBranches(
@@ -1850,18 +3252,29 @@ Each device still needs its own Light Winter Technologies license voucher after 
     if (stockTransfers.length > 100) {
       stockTransfers = stockTransfers.take(100).toList();
     }
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final data = await ApiClient(backendUrl).transferStock(
-            deviceUid, sourceBranch.id, targetBranch.id, product.id, quantity,
-            productName: product.name,
-            userName: currentUser?.name ?? currentUser?.username ?? 'User');
-        _applyBootstrap(data);
-        syncStatus =
-            'Transferred $quantity ${product.name} from ${sourceBranch.name} to ${targetBranch.name}.';
-      } catch (error) {
-        syncStatus = 'Transfer queued locally: $error';
-      }
+      unawaited(_syncStockTransfer(
+          sourceBranch.id,
+          targetBranch.id,
+          product,
+          quantity,
+          'Transferred $quantity ${product.name} from ${sourceBranch.name} to ${targetBranch.name}.'));
+    }
+  }
+
+  Future<void> _syncStockTransfer(String sourceBranchId, String targetBranchId,
+      Product product, int quantity, String successMessage) async {
+    try {
+      final data = await ApiClient(backendUrl).transferStock(
+          deviceUid, sourceBranchId, targetBranchId, product.id, quantity,
+          productName: product.name,
+          userName: currentUser?.name ?? currentUser?.username ?? 'User');
+      _applyBootstrap(data);
+      syncStatus = successMessage;
+    } catch (error) {
+      syncStatus = 'Transfer queued locally: $error';
     }
     await save();
     notifyListeners();
@@ -1876,15 +3289,22 @@ Each device still needs its own Light Winter Technologies license voucher after 
       throw StateError('Current PIN is incorrect.');
     }
     user.pin = newPin;
+    await save();
+    notifyListeners();
     if (user.id != null && organizationId != null) {
-      try {
-        final data =
-            await ApiClient(backendUrl).updateUser(user.id!, deviceUid, user);
-        _applyBootstrap(data);
-        syncStatus = 'PIN synced so the owner can see the latest user PIN.';
-      } catch (error) {
-        syncStatus = 'PIN changed locally and will need sync: $error';
-      }
+      unawaited(_syncPinChange(user));
+    }
+  }
+
+  Future<void> _syncPinChange(AppUser user) async {
+    if (user.id == null) return;
+    try {
+      final data =
+          await ApiClient(backendUrl).updateUser(user.id!, deviceUid, user);
+      _applyBootstrap(data);
+      syncStatus = 'PIN synced so the owner can see the latest user PIN.';
+    } catch (error) {
+      syncStatus = 'PIN changed locally and will need sync: $error';
     }
     await save();
     notifyListeners();
@@ -1895,15 +3315,26 @@ Each device still needs its own Light Winter Technologies license voucher after 
       return runBusy('Saving product...', () => addProduct(product));
     }
     products.add(product);
-    if (assignedBranchId != null) _markCurrentBranchStockInitialized();
+    _assignProductToCurrentBranch(product);
+    await save();
+    notifyListeners();
     if (organizationId != null && currentBranch != null) {
-      try {
-        final data = await ApiClient(backendUrl).createProduct(
-            organizationId!, currentBranch!.id, deviceUid, product);
-        _applyBootstrap(data);
-      } catch (error) {
-        syncStatus = 'Product queued locally: $error';
-      }
+      await _syncProductCreate(product, currentBranch!.id);
+    }
+  }
+
+  Future<void> _syncProductCreate(Product product, String branchId) async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    final localIdBeforeSync = product.id;
+    try {
+      final data = await ApiClient(backendUrl)
+          .createProduct(orgId, branchId, deviceUid, product);
+      _remapProductId(localIdBeforeSync, product.id);
+      if (data.isNotEmpty) _applyBootstrap(data);
+      syncStatus = 'Product synced.';
+    } catch (error) {
+      syncStatus = 'Product queued locally: $error';
     }
     await save();
     notifyListeners();
@@ -1921,16 +3352,24 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     syncStatus =
         'Product details saved locally. Price and stock sync on supported backend columns.';
-    if (assignedBranchId != null) _markCurrentBranchStockInitialized();
+    _assignProductToCurrentBranch(product);
+    await save();
+    notifyListeners();
     if (organizationId != null && currentBranch != null) {
-      try {
-        final data = await ApiClient(backendUrl)
-            .updateProduct(deviceUid, currentBranch!.id, product);
-        _applyBootstrap(data);
-        syncStatus = 'Product details and branch quantity synced.';
-      } catch (error) {
-        syncStatus = 'Product update saved locally: $error';
-      }
+      await _syncProductUpdate(product, currentBranch!.id);
+    }
+  }
+
+  Future<void> _syncProductUpdate(Product product, String branchId) async {
+    final localIdBeforeSync = product.id;
+    try {
+      final data = await ApiClient(backendUrl)
+          .updateProduct(deviceUid, branchId, product);
+      _remapProductId(localIdBeforeSync, product.id);
+      if (data.isNotEmpty) _applyBootstrap(data);
+      syncStatus = 'Product details and branch quantity synced.';
+    } catch (error) {
+      syncStatus = 'Product update saved locally: $error';
     }
     await save();
     notifyListeners();
@@ -1951,15 +3390,21 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     cart.removeWhere((item) => item.product.id == product.id);
     syncStatus = 'Product deleted locally.';
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final data =
-            await ApiClient(backendUrl).deleteProduct(deviceUid, product.id);
-        _applyBootstrap(data);
-        syncStatus = 'Product deleted from shared catalogue.';
-      } catch (error) {
-        syncStatus = 'Product delete saved locally: $error';
-      }
+      unawaited(_syncProductDelete(product.id));
+    }
+  }
+
+  Future<void> _syncProductDelete(String productId) async {
+    try {
+      final data =
+          await ApiClient(backendUrl).deleteProduct(deviceUid, productId);
+      if (data.isNotEmpty) _applyBootstrap(data);
+      syncStatus = 'Product deleted from shared catalogue.';
+    } catch (error) {
+      syncStatus = 'Product delete saved locally: $error';
     }
     await save();
     notifyListeners();
@@ -1971,25 +3416,89 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     var added = 0;
     var updated = 0;
+    final currentBranchProductIds =
+        currentBranchAssignedProducts.map((product) => product.id).toSet();
+    final currentBranchSkuIds = {
+      for (final product in currentBranchAssignedProducts)
+        if (product.sku.trim().isNotEmpty)
+          product.sku.trim().toLowerCase(): product.id
+    };
+    final currentBranchNameIds = {
+      for (final product in currentBranchAssignedProducts)
+        product.name.trim().toLowerCase(): product.id
+    };
     for (final product in imported) {
-      final existingIndex = products.indexWhere((item) =>
-          item.id == product.id ||
-          (product.sku.trim().isNotEmpty &&
-              item.sku.toLowerCase() == product.sku.toLowerCase()) ||
-          item.name.toLowerCase() == product.name.toLowerCase());
+      final matchingId = currentBranchProductIds.contains(product.id)
+          ? product.id
+          : (product.sku.trim().isNotEmpty
+                  ? currentBranchSkuIds[product.sku.trim().toLowerCase()]
+                  : null) ??
+              currentBranchNameIds[product.name.trim().toLowerCase()];
+      final existingIndex = matchingId == null
+          ? -1
+          : products.indexWhere((item) => item.id == matchingId);
       if (existingIndex >= 0) {
         final existing = products[existingIndex];
-        products[existingIndex] = product..id = existing.id;
+        product.id = existing.id;
+        products[existingIndex] = product;
         updated++;
       } else {
         products.add(product);
         added++;
       }
+      _assignProductToCurrentBranch(product);
     }
-    if (assignedBranchId != null) _markCurrentBranchStockInitialized();
     syncStatus = 'CSV import saved locally: $added added, $updated updated.';
     await save();
     notifyListeners();
+    if (organizationId != null && currentBranch != null) {
+      await _syncImportedStock(imported, currentBranch!.id);
+    }
+  }
+
+  Future<void> _syncImportedStock(
+      List<Product> imported, String branchId) async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    try {
+      for (final supplier in suppliers) {
+        await ApiClient(backendUrl)
+            .upsertSupplier(orgId, deviceUid, supplier, refresh: false);
+      }
+      final oldIdsByObject = {
+        for (final product in imported) product: product.id
+      };
+      final data = await ApiClient(backendUrl)
+          .upsertProducts(orgId, branchId, deviceUid, imported);
+      for (final product in imported) {
+        _remapProductId(oldIdsByObject[product] ?? product.id, product.id);
+      }
+      if (data.isNotEmpty) _applyBootstrap(data);
+      syncStatus = 'CSV import synced to cloud.';
+    } catch (error) {
+      syncStatus = 'CSV import saved locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  void _remapProductId(String oldId, String newId) {
+    if (oldId == newId || oldId.trim().isEmpty || newId.trim().isEmpty) return;
+    for (final snapshot in branchStockSnapshots.values) {
+      if (snapshot.containsKey(oldId)) {
+        final existing = snapshot[newId] ?? 0;
+        final moved = snapshot.remove(oldId) ?? 0;
+        snapshot[newId] = max(existing, moved);
+      }
+    }
+    for (final cartName in openCarts.keys.toList()) {
+      for (final item in openCarts[cartName] ?? <CartItem>[]) {
+        if (item.product.id == oldId) item.product.id = newId;
+      }
+    }
+    for (final item in cart) {
+      if (item.product.id == oldId) item.product.id = newId;
+    }
   }
 
   Future<void> addSupplier(Supplier supplier) async {
@@ -1999,6 +3508,9 @@ Each device still needs its own Light Winter Technologies license voucher after 
     suppliers.add(supplier);
     await save();
     notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncSupplierUpsert(supplier));
+    }
   }
 
   Future<void> updateSupplier(Supplier supplier) async {
@@ -2013,6 +3525,9 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     await save();
     notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncSupplierUpsert(supplier));
+    }
   }
 
   Future<void> deleteSupplier(Supplier supplier) async {
@@ -2025,12 +3540,44 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     await save();
     notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncSupplierDelete(supplier.id));
+    }
+  }
+
+  Future<void> _syncSupplierUpsert(Supplier supplier) async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    try {
+      final data = await ApiClient(backendUrl)
+          .upsertSupplier(orgId, deviceUid, supplier);
+      _applyBootstrap(data);
+      syncStatus = 'Supplier synced.';
+    } catch (error) {
+      syncStatus = 'Supplier saved locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> _syncSupplierDelete(String supplierId) async {
+    try {
+      final data =
+          await ApiClient(backendUrl).deleteSupplier(deviceUid, supplierId);
+      _applyBootstrap(data);
+      syncStatus = 'Supplier deleted from cloud.';
+    } catch (error) {
+      syncStatus = 'Supplier deleted locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
   }
 
   Future<void> deleteAllProducts() async {
     if (_busyDepth == 0) {
       return runBusy('Deleting products...', deleteAllProducts);
     }
+    final productIds = products.map((product) => product.id).toList();
     products.clear();
     branchStockSnapshots.clear();
     branchStockInitialized.clear();
@@ -2040,12 +3587,16 @@ Each device still needs its own Light Winter Technologies license voucher after 
     syncStatus = 'All products deleted locally.';
     await save();
     notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncProductBulkDelete(productIds));
+    }
   }
 
   Future<void> deleteAllSuppliers() async {
     if (_busyDepth == 0) {
       return runBusy('Deleting suppliers...', deleteAllSuppliers);
     }
+    final supplierIds = suppliers.map((supplier) => supplier.id).toList();
     suppliers.clear();
     for (final product in products) {
       product.supplierId = '';
@@ -2053,12 +3604,17 @@ Each device still needs its own Light Winter Technologies license voucher after 
     syncStatus = 'All suppliers deleted locally.';
     await save();
     notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncSupplierBulkDelete(supplierIds));
+    }
   }
 
   Future<void> deleteAllStockData() async {
     if (_busyDepth == 0) {
       return runBusy('Deleting stock data...', deleteAllStockData);
     }
+    final productIds = products.map((product) => product.id).toList();
+    final supplierIds = suppliers.map((supplier) => supplier.id).toList();
     products.clear();
     suppliers.clear();
     branchStockSnapshots.clear();
@@ -2070,6 +3626,217 @@ Each device still needs its own Light Winter Technologies license voucher after 
     syncStatus = 'All stock products and suppliers deleted locally.';
     await save();
     notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncStockBulkDelete(productIds, supplierIds));
+    }
+  }
+
+  Future<void> deleteAllReportHistory({required bool allBranches}) async {
+    if (_busyDepth == 0) {
+      return runBusy('Deleting report history...',
+          () => deleteAllReportHistory(allBranches: allBranches));
+    }
+    final targetSales = allBranches ? allKnownSales : [...sales];
+    final saleIds = targetSales.map((sale) => sale.id).toSet();
+    if (allBranches) {
+      sales.clear();
+      branchSaleSnapshots.clear();
+    } else {
+      sales.clear();
+      final branchId = assignedBranchId;
+      if (branchId != null) branchSaleSnapshots[branchId] = [];
+    }
+    saleVoids.removeWhere((record) => saleIds.contains(record.saleId));
+    pendingSaleSyncIds.removeWhere(saleIds.contains);
+    syncStatus = allBranches
+        ? 'All report, sales, and debt history deleted locally.'
+        : 'This branch report, sales, and debt history deleted locally.';
+    await save();
+    notifyListeners();
+    if (organizationId != null && saleIds.isNotEmpty) {
+      unawaited(_syncSaleBulkDelete(saleIds.toList()));
+    }
+  }
+
+  Future<void> deleteAllDebtHistory() async {
+    if (_busyDepth == 0) {
+      return runBusy('Deleting debt history...', deleteAllDebtHistory);
+    }
+    final saleIds = debtSales.map((sale) => sale.id).toSet();
+    sales.removeWhere((sale) => saleIds.contains(sale.id));
+    branchSaleSnapshots.updateAll((_, branchSales) =>
+        branchSales.where((sale) => !saleIds.contains(sale.id)).toList());
+    saleVoids.removeWhere((record) => saleIds.contains(record.saleId));
+    pendingSaleSyncIds.removeWhere(saleIds.contains);
+    syncStatus = 'Debt history deleted locally.';
+    await save();
+    notifyListeners();
+    if (organizationId != null && saleIds.isNotEmpty) {
+      unawaited(_syncSaleBulkDelete(saleIds.toList()));
+    }
+  }
+
+  Future<void> deleteAllCustomers() async {
+    if (_busyDepth == 0) {
+      return runBusy('Deleting customers...', deleteAllCustomers);
+    }
+    final customerIds = customers.map((customer) => customer.id).toList();
+    customers.clear();
+    syncStatus = 'All customer records deleted locally.';
+    await save();
+    notifyListeners();
+    if (organizationId != null && customerIds.isNotEmpty) {
+      unawaited(_syncCustomerBulkDelete(customerIds));
+    }
+  }
+
+  Future<void> deleteAllTransferHistory() async {
+    if (_busyDepth == 0) {
+      return runBusy('Deleting transfer history...', deleteAllTransferHistory);
+    }
+    final transferIds = stockTransfers.map((transfer) => transfer.id).toList();
+    stockTransfers.clear();
+    syncStatus = 'Transfer history deleted locally.';
+    await save();
+    notifyListeners();
+    if (organizationId != null && transferIds.isNotEmpty) {
+      unawaited(_syncTransferBulkDelete(transferIds));
+    }
+  }
+
+  Future<void> _syncProductBulkDelete(List<String> productIds) async {
+    try {
+      for (final productId in productIds) {
+        await ApiClient(backendUrl).deleteProduct(deviceUid, productId);
+      }
+      syncStatus = 'Products deleted from cloud.';
+    } catch (error) {
+      syncStatus = 'Products deleted locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> deleteSaleRecord(SaleRecord sale) async {
+    if (_busyDepth == 0) {
+      return runBusy('Deleting sale...', () => deleteSaleRecord(sale));
+    }
+    sales.removeWhere((item) => item.id == sale.id);
+    branchSaleSnapshots.updateAll(
+        (_, list) => list.where((item) => item.id != sale.id).toList());
+    saleVoids.removeWhere((record) => record.saleId == sale.id);
+    syncStatus = 'Sale deleted locally.';
+    await save();
+    notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncSaleBulkDelete([sale.id]));
+    }
+  }
+
+  Future<void> deleteVoidRecord(SaleVoidRecord record) async {
+    if (_busyDepth == 0) {
+      return runBusy('Deleting void record...', () => deleteVoidRecord(record));
+    }
+    saleVoids.removeWhere((item) => item.id == record.id);
+    syncStatus = 'Void/return record deleted locally.';
+    await save();
+    notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncVoidBulkDelete([record.id]));
+    }
+  }
+
+  Future<void> deleteAllVoidHistory() async {
+    if (_busyDepth == 0) {
+      return runBusy('Deleting void history...', deleteAllVoidHistory);
+    }
+    final ids = saleVoids.map((record) => record.id).toList();
+    saleVoids.clear();
+    syncStatus = 'Void/return history deleted locally.';
+    await save();
+    notifyListeners();
+    if (ids.isNotEmpty && organizationId != null) {
+      unawaited(_syncVoidBulkDelete(ids));
+    }
+  }
+
+  Future<void> _syncSupplierBulkDelete(List<String> supplierIds) async {
+    try {
+      for (final supplierId in supplierIds) {
+        await ApiClient(backendUrl).deleteSupplier(deviceUid, supplierId);
+      }
+      final data = await ApiClient(backendUrl).bootstrap(deviceUid);
+      _applyBootstrap(data);
+      syncStatus = 'Suppliers deleted from cloud.';
+    } catch (error) {
+      syncStatus = 'Suppliers deleted locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> _syncStockBulkDelete(
+      List<String> productIds, List<String> supplierIds) async {
+    try {
+      for (final productId in productIds) {
+        await ApiClient(backendUrl).deleteProduct(deviceUid, productId);
+      }
+      for (final supplierId in supplierIds) {
+        await ApiClient(backendUrl).deleteSupplier(deviceUid, supplierId);
+      }
+      syncStatus = 'Stock data deleted from cloud.';
+    } catch (error) {
+      syncStatus = 'Stock deleted locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> _syncSaleBulkDelete(List<String> saleIds) async {
+    try {
+      await ApiClient(backendUrl).deleteSales(deviceUid, saleIds);
+      syncStatus = 'Report, sales, and debt history deleted from cloud.';
+    } catch (error) {
+      syncStatus =
+          'Report, sales, and debt history deleted locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> _syncCustomerBulkDelete(List<String> customerIds) async {
+    try {
+      await ApiClient(backendUrl).deleteCustomers(deviceUid, customerIds);
+      syncStatus = 'Customers deleted from cloud.';
+    } catch (error) {
+      syncStatus = 'Customers deleted locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> _syncTransferBulkDelete(List<String> transferIds) async {
+    try {
+      await ApiClient(backendUrl).deleteStockTransfers(deviceUid, transferIds);
+      syncStatus = 'Transfer history deleted from cloud.';
+    } catch (error) {
+      syncStatus =
+          'Transfer history deleted locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> _syncVoidBulkDelete(List<String> voidIds) async {
+    try {
+      await ApiClient(backendUrl).deleteSaleVoids(deviceUid, voidIds);
+      syncStatus = 'Void/return history deleted from cloud.';
+    } catch (error) {
+      syncStatus =
+          'Void/return history deleted locally. Cloud sync failed: $error';
+    }
+    await save();
+    notifyListeners();
   }
 
   Future<void> adjustStock(Product product, int delta) async {
@@ -2078,14 +3845,22 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     product.stock += delta;
     _markCurrentBranchStockInitialized();
+    await save();
+    notifyListeners();
     if (organizationId != null && currentBranch != null) {
-      try {
-        final data = await ApiClient(backendUrl)
-            .adjustStock(deviceUid, currentBranch!.id, product.id, delta);
-        _applyBootstrap(data);
-      } catch (error) {
-        syncStatus = 'Stock adjustment queued locally: $error';
-      }
+      unawaited(_syncStockAdjustment(product.id, currentBranch!.id, delta));
+    }
+  }
+
+  Future<void> _syncStockAdjustment(
+      String productId, String branchId, int delta) async {
+    try {
+      final data = await ApiClient(backendUrl)
+          .adjustStock(deviceUid, branchId, productId, delta);
+      _applyBootstrap(data);
+      syncStatus = 'Stock adjustment synced.';
+    } catch (error) {
+      syncStatus = 'Stock adjustment queued locally: $error';
     }
     await save();
     notifyListeners();
@@ -2213,6 +3988,20 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
   }
 
+  void setCartItemQuantity(CartItem item, int quantity) {
+    final next = max(0, quantity);
+    if (next == 0) {
+      cart.remove(item);
+    } else {
+      final available = item.product.isCustom
+          ? 999999
+          : max(sellableQuantityFor(item.product), item.quantity);
+      item.quantity = item.product.isCustom ? next : min(next, available);
+    }
+    _persistActiveCartDraft();
+    notifyListeners();
+  }
+
   void decrementCartItem(CartItem item) {
     item.quantity -= 1;
     if (item.quantity <= 0) cart.remove(item);
@@ -2289,6 +4078,8 @@ Each device still needs its own Light Winter Technologies license voucher after 
                 quantity: item.quantity,
                 unitPriceCents: item.product.priceCents,
                 lineTotalCents: item.product.priceCents * item.quantity,
+                unitCostCents: item.product.costCents,
+                lineCostCents: item.product.costCents * item.quantity,
               ))
           .toList(),
       createdAt: DateTime.now(),
@@ -2296,24 +4087,100 @@ Each device still needs its own Light Winter Technologies license voucher after 
     sales.add(sale);
     cart.clear();
     closeOpenCart(activeCartName);
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final syncedLines =
-            saleLines.where((item) => !item.product.isCustom).toList();
-        await ApiClient(backendUrl).createSale(deviceUid, currentUser?.id,
-            customer?.id, paymentMethod, syncedLines, sales.last.totalCents,
-            discountCents: discountCents,
-            paidCents: paidCents,
-            changeCents: changeCents,
-            debtCents: debtCents);
-        await syncNow();
-      } catch (error) {
-        syncStatus = 'Sale queued locally: $error';
-      }
+      unawaited(_syncSaleInBackground(
+          sale: sale,
+          saleLines: saleLines,
+          customer: customer,
+          paymentMethod: paymentMethod,
+          totalCents: sale.totalCents,
+          discountCents: discountCents,
+          paidCents: paidCents,
+          changeCents: changeCents,
+          debtCents: debtCents));
+    }
+    return sale;
+  }
+
+  Future<void> _syncSaleInBackground({
+    required SaleRecord sale,
+    required List<CartItem> saleLines,
+    required Customer? customer,
+    required String paymentMethod,
+    required int totalCents,
+    required int discountCents,
+    required int paidCents,
+    required int changeCents,
+    required int debtCents,
+  }) async {
+    try {
+      final syncedLines = saleLines;
+      await ApiClient(backendUrl).createSale(deviceUid, currentUser?.id,
+          customer?.id, paymentMethod, syncedLines, totalCents,
+          saleId: sale.id,
+          discountCents: discountCents,
+          paidCents: paidCents,
+          changeCents: changeCents,
+          debtCents: debtCents);
+      syncStatus = 'Sale synced.';
+      pendingSaleSyncIds.remove(sale.id);
+      await save();
+      notifyListeners();
+    } catch (error) {
+      pendingSaleSyncIds.add(sale.id);
+      syncStatus = 'Sale queued locally: $error';
+      await save();
+      notifyListeners();
+    }
+  }
+
+  Future<void> settleDebt(SaleRecord sale, int amountCents) async {
+    if (_busyDepth == 0) {
+      return runBusy(
+          'Saving debt payment...', () => settleDebt(sale, amountCents));
+    }
+    if (amountCents <= 0) throw StateError('Enter a valid payment amount.');
+    final balance = debtBalanceForSale(sale);
+    if (balance <= 0) throw StateError('This debt is already fully paid.');
+    final applied = min(amountCents, balance);
+    sale.paidCents += applied;
+    sale.debtCents = max(0, sale.debtCents - applied);
+    accountingEntries.insert(
+        0,
+        AccountingEntry(
+            id: newId(),
+            branchId: sale.branchId.isNotEmpty
+                ? sale.branchId
+                : assignedBranchId ?? '',
+            type: AccountingEntryType.income,
+            category: 'Customer Debt Payment',
+            description: sale.customerName.isEmpty
+                ? 'Debt payment for ${sale.id}'
+                : 'Debt payment from ${sale.customerName}',
+            amountCents: applied,
+            paymentMethod: 'Cash',
+            counterparty: sale.customerName,
+            createdAt: DateTime.now()));
+    await save();
+    notifyListeners();
+    if (organizationId != null) {
+      unawaited(_syncDebtSettlement(sale));
+      unawaited(_syncAccountingEntryCreate(accountingEntries.first));
+    }
+  }
+
+  Future<void> _syncDebtSettlement(SaleRecord sale) async {
+    try {
+      await ApiClient(backendUrl)
+          .updateSaleDebt(deviceUid, sale.id, sale.paidCents, sale.debtCents);
+      syncStatus = 'Debt payment synced.';
+    } catch (error) {
+      syncStatus = 'Debt payment saved locally: $error';
     }
     await save();
     notifyListeners();
-    return sale;
   }
 
   Future<void> voidSale(
@@ -2359,16 +4226,22 @@ Each device still needs its own Light Winter Technologies license voucher after 
     if (saleVoids.length > 300) {
       saleVoids = saleVoids.take(300).toList();
     }
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final data = await ApiClient(backendUrl)
-            .voidSale(deviceUid, currentUser?.id, record);
-        _applyBootstrap(data);
-        syncStatus =
-            '${type == 'full_void' ? 'Full void' : 'Partial void'} synced.';
-      } catch (error) {
-        syncStatus = 'Void queued locally: $error';
-      }
+      unawaited(_syncVoidSale(record, type));
+    }
+  }
+
+  Future<void> _syncVoidSale(SaleVoidRecord record, String type) async {
+    try {
+      final data = await ApiClient(backendUrl)
+          .voidSale(deviceUid, currentUser?.id, record);
+      _applyBootstrap(data);
+      syncStatus =
+          '${type == 'full_void' ? 'Full void' : 'Partial void'} synced.';
+    } catch (error) {
+      syncStatus = 'Void queued locally: $error';
     }
     await save();
     notifyListeners();
@@ -2396,18 +4269,27 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     final customer = Customer(id: newId(), name: name, phone: phone);
     customers.add(customer);
+    await save();
+    notifyListeners();
     if (organizationId != null) {
-      try {
-        final data = await ApiClient(backendUrl)
-            .createCustomer(organizationId!, deviceUid, customer);
-        _applyBootstrap(data);
-      } catch (error) {
-        syncStatus = 'Customer queued locally: $error';
-      }
+      unawaited(_syncCustomerCreate(customer));
+    }
+    return customer;
+  }
+
+  Future<void> _syncCustomerCreate(Customer customer) async {
+    final orgId = organizationId;
+    if (orgId == null) return;
+    try {
+      final data = await ApiClient(backendUrl)
+          .createCustomer(orgId, deviceUid, customer);
+      _applyBootstrap(data);
+      syncStatus = 'Customer synced.';
+    } catch (error) {
+      syncStatus = 'Customer queued locally: $error';
     }
     await save();
     notifyListeners();
-    return customer;
   }
 
   Future<void> applyLicense(String token) async {
@@ -2728,9 +4610,9 @@ class AppUser {
       username: json['username'] ?? json['name'] ?? '',
       role: role,
       pin: json['pin'] ?? '',
-      permissions: rawPermissions
-          .where((item) => !item.startsWith('branch:'))
-          .toList()
+      permissions: normalizePermissions(rawPermissions
+              .where((item) => !item.startsWith('branch:'))
+              .toList())
           .ifEmpty(defaultPermissionsForRole(role)),
       branchIds: List<String>.from(json['branchIds'] ??
           rawPermissions
@@ -2747,9 +4629,9 @@ class AppUser {
       username: json['username'] ?? json['name'] ?? '',
       role: role,
       pin: json['pin'] ?? '',
-      permissions: rawPermissions
-          .where((item) => !item.startsWith('branch:'))
-          .toList()
+      permissions: normalizePermissions(rawPermissions
+              .where((item) => !item.startsWith('branch:'))
+              .toList())
           .ifEmpty(defaultPermissionsForRole(role)),
       branchIds: rawPermissions
           .where((item) => item.startsWith('branch:'))
@@ -2777,6 +4659,7 @@ class UserDraft {
 
 class AppPermission {
   static const dashboard = 'dashboard';
+  static const profit = 'profit';
   static const pos = 'pos';
   static const inventory = 'inventory';
   static const branches = 'branches';
@@ -2786,6 +4669,17 @@ class AppPermission {
   static const admin = 'admin';
 
   static const all = [
+    dashboard,
+    profit,
+    pos,
+    inventory,
+    branches,
+    customers,
+    printing,
+    fiscal,
+    admin
+  ];
+  static const legacyAll = [
     dashboard,
     pos,
     inventory,
@@ -2797,6 +4691,7 @@ class AppPermission {
   ];
   static const labels = {
     dashboard: 'Dashboard and reports',
+    profit: 'Profit and loss accounting',
     pos: 'POS selling',
     inventory: 'Inventory and stock',
     branches: 'Branches and device assignment',
@@ -2807,11 +4702,20 @@ class AppPermission {
   };
 }
 
+List<String> normalizePermissions(List<String> permissions) {
+  final unique = permissions.toSet();
+  final hadLegacyFullAccess = AppPermission.legacyAll
+      .every((permission) => unique.contains(permission));
+  if (hadLegacyFullAccess) unique.add(AppPermission.profit);
+  return unique.toList();
+}
+
 List<String> defaultPermissionsForRole(String role) {
   return switch (role) {
     'Owner' => AppPermission.all,
     'Manager' => [
         AppPermission.dashboard,
+        AppPermission.profit,
         AppPermission.pos,
         AppPermission.inventory,
         AppPermission.branches,
@@ -2824,9 +4728,14 @@ List<String> defaultPermissionsForRole(String role) {
         AppPermission.printing
       ],
     'Stock Clerk' => [AppPermission.inventory],
-    'Auditor' => [AppPermission.dashboard, AppPermission.printing],
+    'Auditor' => [
+        AppPermission.dashboard,
+        AppPermission.profit,
+        AppPermission.printing
+      ],
     'Branch Supervisor' => [
         AppPermission.dashboard,
+        AppPermission.profit,
         AppPermission.pos,
         AppPermission.inventory,
         AppPermission.branches,
@@ -2869,6 +4778,7 @@ class Product {
       required this.sku,
       required this.barcode,
       required this.priceCents,
+      this.costCents = 0,
       required this.stock,
       required this.reorderLevel,
       this.supplierId = '',
@@ -2879,6 +4789,7 @@ class Product {
   String sku;
   String barcode;
   int priceCents;
+  int costCents;
   int stock;
   int reorderLevel;
   String supplierId;
@@ -2890,6 +4801,7 @@ class Product {
         'sku': sku,
         'barcode': barcode,
         'priceCents': priceCents,
+        'costCents': costCents,
         'stock': stock,
         'reorderLevel': reorderLevel,
         'supplierId': supplierId,
@@ -2901,10 +4813,11 @@ class Product {
       category: json['category'] ?? '',
       sku: json['sku'] ?? '',
       barcode: json['barcode'] ?? '',
-      priceCents: json['priceCents'],
-      stock: json['stock'],
+      priceCents: json['priceCents'] ?? json['price_cents'] ?? 0,
+      costCents: json['costCents'] ?? json['cost_price_cents'] ?? 0,
+      stock: json['stock'] ?? 0,
       reorderLevel: json['reorderLevel'] ?? 5,
-      supplierId: json['supplierId'] ?? '',
+      supplierId: json['supplierId'] ?? json['supplier_id'] ?? '',
       isCustom: json['isCustom'] ?? false);
   factory Product.fromApi(Map<String, dynamic> json, int stock) => Product(
       id: json['id'],
@@ -2913,6 +4826,7 @@ class Product {
       sku: json['sku'] ?? '',
       barcode: json['barcode'] ?? '',
       priceCents: json['price_cents'],
+      costCents: json['cost_price_cents'] ?? 0,
       stock: stock,
       reorderLevel: json['reorder_level'] ?? 5,
       supplierId: json['supplier_id'] ?? '');
@@ -2933,16 +4847,28 @@ class Supplier {
       name: json['name'] ?? '',
       phone: json['phone'] ?? '',
       notes: json['notes'] ?? '');
+  factory Supplier.fromApi(Map<String, dynamic> json) => Supplier(
+      id: json['id'],
+      name: json['name'] ?? '',
+      phone: json['phone'] ?? '',
+      notes: json['notes'] ?? '');
 }
 
 class Customer {
-  Customer({required this.id, required this.name, required this.phone});
+  Customer(
+      {required this.id, required this.name, required this.phone, String? code})
+      : code = code ?? customerShortCode(id);
   String id;
   String name;
   String phone;
-  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'phone': phone};
-  factory Customer.fromJson(Map<String, dynamic> json) =>
-      Customer(id: json['id'], name: json['name'], phone: json['phone'] ?? '');
+  String code;
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'name': name, 'phone': phone, 'code': code};
+  factory Customer.fromJson(Map<String, dynamic> json) => Customer(
+      id: json['id'],
+      name: json['name'],
+      phone: json['phone'] ?? '',
+      code: json['code']);
   factory Customer.fromApi(Map<String, dynamic> json) =>
       Customer(id: json['id'], name: json['name'], phone: json['phone'] ?? '');
 }
@@ -3049,10 +4975,18 @@ class SaleRecord {
 
 class ReportProductPerformance {
   const ReportProductPerformance(
-      {required this.name, required this.quantity, required this.revenueCents});
+      {required this.name,
+      required this.quantity,
+      required this.revenueCents,
+      this.branchName = '',
+      this.costCents = 0,
+      this.profitCents = 0});
   final String name;
+  final String branchName;
   final int quantity;
   final int revenueCents;
+  final int costCents;
+  final int profitCents;
 }
 
 class ReportSnapshot {
@@ -3063,6 +4997,12 @@ class ReportSnapshot {
     required this.grossSalesCents,
     required this.voidedCents,
     required this.discountCents,
+    required this.costOfGoodsCents,
+    required this.grossProfitCents,
+    required this.grossMarginPercent,
+    required this.stockValueAtCostCents,
+    required this.stockValueAtRetailCents,
+    required this.potentialStockProfitCents,
     required this.debtCents,
     required this.paidCents,
     required this.transactionCount,
@@ -3081,6 +5021,12 @@ class ReportSnapshot {
   final int grossSalesCents;
   final int voidedCents;
   final int discountCents;
+  final int costOfGoodsCents;
+  final int grossProfitCents;
+  final double grossMarginPercent;
+  final int stockValueAtCostCents;
+  final int stockValueAtRetailCents;
+  final int potentialStockProfitCents;
   final int debtCents;
   final int paidCents;
   final int transactionCount;
@@ -3100,6 +5046,8 @@ class UserPerformanceReport {
     required this.grossCents,
     required this.voidedCents,
     required this.netCents,
+    required this.costCents,
+    required this.profitCents,
     required this.debtCents,
   });
 
@@ -3108,7 +5056,224 @@ class UserPerformanceReport {
   final int grossCents;
   final int voidedCents;
   final int netCents;
+  final int costCents;
+  final int profitCents;
   final int debtCents;
+}
+
+enum AccountingEntryType { expense, income }
+
+AccountingEntryType accountingEntryTypeFromText(String value) =>
+    value.toLowerCase() == 'income'
+        ? AccountingEntryType.income
+        : AccountingEntryType.expense;
+
+class AccountingEntry {
+  AccountingEntry({
+    required this.id,
+    required this.branchId,
+    required this.type,
+    required this.category,
+    required this.description,
+    required this.amountCents,
+    this.paymentMethod = '',
+    this.counterparty = '',
+    required this.createdAt,
+  });
+
+  String id;
+  String branchId;
+  AccountingEntryType type;
+  String category;
+  String description;
+  int amountCents;
+  String paymentMethod;
+  String counterparty;
+  DateTime createdAt;
+
+  String get typeText =>
+      type == AccountingEntryType.income ? 'income' : 'expense';
+  String get typeLabel =>
+      type == AccountingEntryType.income ? 'Income' : 'Expense';
+  String get normalizedCategory => category.trim().toLowerCase();
+  bool get isStockPurchase => normalizedCategory == 'stock purchase';
+  bool get isSupplierPayment => normalizedCategory == 'supplier payment';
+  bool get isOwnerDrawing => normalizedCategory == 'owner drawings';
+  bool get isPayroll =>
+      normalizedCategory == 'payroll' ||
+      normalizedCategory == 'salary payment' ||
+      normalizedCategory == 'employee advance';
+  int get batchQuantity {
+    final match = RegExp(r'(\d+)\s+x\s+').firstMatch(description);
+    return int.tryParse(match?.group(1) ?? '') ?? 0;
+  }
+
+  String get batchProductName {
+    final withoutQuantity =
+        description.replaceFirst(RegExp(r'^\s*\d+\s+x\s+'), '').trim();
+    final pipeIndex = withoutQuantity.indexOf('|');
+    return (pipeIndex >= 0
+            ? withoutQuantity.substring(0, pipeIndex)
+            : withoutQuantity)
+        .trim();
+  }
+
+  String get batchNumber {
+    final match = RegExp(r'Batch:\s*([^|]+)', caseSensitive: false)
+        .firstMatch(description);
+    return match?.group(1)?.trim() ?? '';
+  }
+
+  DateTime? get batchExpiryDate {
+    final match = RegExp(r'Expiry:\s*(\d{4}-\d{2}-\d{2})', caseSensitive: false)
+        .firstMatch(description);
+    return DateTime.tryParse(match?.group(1) ?? '');
+  }
+
+  bool get isBalanceSheetOnly =>
+      isStockPurchase ||
+      isSupplierPayment ||
+      isOwnerDrawing ||
+      normalizedCategory == 'owner capital' ||
+      normalizedCategory == 'cash transfer' ||
+      normalizedCategory == 'customer debt payment' ||
+      normalizedCategory == 'purchase order' ||
+      normalizedCategory == 'stock count' ||
+      normalizedCategory == 'cash-up' ||
+      normalizedCategory == 'reconciliation';
+  bool get affectsProfitAndLoss => !isBalanceSheetOnly;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'branchId': branchId,
+        'type': typeText,
+        'category': category,
+        'description': description,
+        'amountCents': amountCents,
+        'paymentMethod': paymentMethod,
+        'counterparty': counterparty,
+        'createdAt': createdAt.toIso8601String(),
+      };
+
+  factory AccountingEntry.fromJson(Map<String, dynamic> json) =>
+      AccountingEntry(
+        id: '${json['id']}',
+        branchId: json['branchId'] ?? json['branch_id'] ?? '',
+        type: accountingEntryTypeFromText('${json['type'] ?? 'expense'}'),
+        category: json['category'] ?? 'General',
+        description: json['description'] ?? '',
+        amountCents: json['amountCents'] ?? json['amount_cents'] ?? 0,
+        paymentMethod: json['paymentMethod'] ?? json['payment_method'] ?? '',
+        counterparty: json['counterparty'] ?? '',
+        createdAt: DateTime.tryParse(
+              '${json['createdAt'] ?? json['created_at'] ?? ''}',
+            )?.toLocal() ??
+            DateTime.now(),
+      );
+}
+
+class ProfitLossStatement {
+  ProfitLossStatement({
+    required this.period,
+    required this.report,
+    required this.entries,
+    required this.operatingExpensesCents,
+    required this.otherIncomeCents,
+    required this.netProfitCents,
+    required this.netMarginPercent,
+    required this.stockPurchasesCents,
+    required this.supplierPaymentsCents,
+    required this.supplierPayablesCents,
+    required this.customerDebtOutstandingCents,
+    required this.ownerCapitalCents,
+    required this.ownerDrawingsCents,
+    required this.supplierBalances,
+    required this.cashbookByMethod,
+    required this.customerDebtAging,
+    required this.expensesByCategory,
+    required this.incomeByCategory,
+  });
+
+  final String period;
+  final ReportSnapshot report;
+  final List<AccountingEntry> entries;
+  final int operatingExpensesCents;
+  final int otherIncomeCents;
+  final int netProfitCents;
+  final double netMarginPercent;
+  final int stockPurchasesCents;
+  final int supplierPaymentsCents;
+  final int supplierPayablesCents;
+  final int customerDebtOutstandingCents;
+  final int ownerCapitalCents;
+  final int ownerDrawingsCents;
+  final Map<String, int> supplierBalances;
+  final Map<String, int> cashbookByMethod;
+  final Map<String, int> customerDebtAging;
+  final Map<String, int> expensesByCategory;
+  final Map<String, int> incomeByCategory;
+
+  String get title => switch (period) {
+        'yearly' => 'Yearly',
+        'weekly' => 'Weekly',
+        'monthly' => 'Monthly',
+        _ => 'Daily',
+      };
+}
+
+class BatchExpiryRecord {
+  const BatchExpiryRecord({
+    required this.entry,
+    required this.productName,
+    required this.batchNumber,
+    required this.expiryDate,
+    required this.quantity,
+  });
+
+  final AccountingEntry entry;
+  final String productName;
+  final String batchNumber;
+  final DateTime expiryDate;
+  final int quantity;
+
+  bool get expired => expiryDate.isBefore(
+      DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day));
+
+  int get daysLeft =>
+      DateTime(expiryDate.year, expiryDate.month, expiryDate.day)
+          .difference(DateTime(
+              DateTime.now().year, DateTime.now().month, DateTime.now().day))
+          .inDays;
+}
+
+class AuditRow {
+  const AuditRow({
+    required this.when,
+    required this.action,
+    required this.actor,
+    required this.branch,
+    required this.detail,
+  });
+
+  final DateTime when;
+  final String action;
+  final String actor;
+  final String branch;
+  final String detail;
+}
+
+class SmartInsight {
+  const SmartInsight({
+    required this.tone,
+    required this.title,
+    required this.body,
+    required this.icon,
+  });
+
+  final Tone tone;
+  final String title;
+  final String body;
+  final IconData icon;
 }
 
 class SaleVoidRecord {
@@ -3252,13 +5417,19 @@ class ReceiptLineSnapshot {
     required this.quantity,
     required this.unitPriceCents,
     required this.lineTotalCents,
-  });
+    this.unitCostCents = 0,
+    int? lineCostCents,
+  }) : _lineCostCents = lineCostCents;
 
   String productId;
   String name;
   int quantity;
   int unitPriceCents;
   int lineTotalCents;
+  int unitCostCents;
+  int? _lineCostCents;
+  int get lineCostCents => _lineCostCents ?? unitCostCents * quantity;
+  set lineCostCents(int value) => _lineCostCents = value;
 
   Map<String, dynamic> toJson() => {
         'productId': productId,
@@ -3266,15 +5437,23 @@ class ReceiptLineSnapshot {
         'quantity': quantity,
         'unitPriceCents': unitPriceCents,
         'lineTotalCents': lineTotalCents,
+        'unitCostCents': unitCostCents,
+        'lineCostCents': lineCostCents,
       };
 
   factory ReceiptLineSnapshot.fromJson(Map<String, dynamic> json) =>
       ReceiptLineSnapshot(
         productId: json['productId'] ?? json['product_id'] ?? '',
-        name: json['name'] ?? '',
+        name: json['name'] ??
+            json['productName'] ??
+            json['product_name'] ??
+            json['description'] ??
+            '',
         quantity: json['quantity'] ?? 1,
-        unitPriceCents: json['unitPriceCents'] ?? 0,
-        lineTotalCents: json['lineTotalCents'] ?? 0,
+        unitPriceCents: json['unitPriceCents'] ?? json['unit_price_cents'] ?? 0,
+        lineTotalCents: json['lineTotalCents'] ?? json['line_total_cents'] ?? 0,
+        unitCostCents: json['unitCostCents'] ?? json['unit_cost_cents'] ?? 0,
+        lineCostCents: json['lineCostCents'] ?? json['line_cost_cents'],
       );
 
   bool matches(ReceiptLineSnapshot other) {
@@ -3504,6 +5683,7 @@ class ApiClient {
       'barcode': product.barcode,
       'name': product.name,
       'selling_price_cents': product.priceCents,
+      'buying_cost_cents': product.costCents,
       'reorder_threshold': product.reorderLevel,
     });
     await _post('/api/stock/adjust', {
@@ -3528,6 +5708,32 @@ class ApiClient {
           ? _supabase.deleteProduct(deviceUid, productId)
           : bootstrap(deviceUid);
 
+  Future<Map<String, dynamic>> upsertProduct(
+          String orgId, String branchId, String deviceUid, Product product) =>
+      usesSupabase
+          ? _supabase.upsertProduct(orgId, branchId, deviceUid, product)
+          : updateProduct(deviceUid, branchId, product);
+
+  Future<Map<String, dynamic>> upsertProducts(String orgId, String branchId,
+          String deviceUid, List<Product> products) =>
+      usesSupabase
+          ? _supabase.upsertProducts(orgId, branchId, deviceUid, products)
+          : bootstrap(deviceUid);
+
+  Future<Map<String, dynamic>> upsertSupplier(
+          String orgId, String deviceUid, Supplier supplier,
+          {bool refresh = true}) =>
+      usesSupabase
+          ? _supabase.upsertSupplier(orgId, deviceUid, supplier,
+              refresh: refresh)
+          : bootstrap(deviceUid);
+
+  Future<Map<String, dynamic>> deleteSupplier(
+          String deviceUid, String supplierId) =>
+      usesSupabase
+          ? _supabase.deleteSupplier(deviceUid, supplierId)
+          : bootstrap(deviceUid);
+
   Future<void> createSale(
       String deviceUid,
       String? cashierId,
@@ -3535,13 +5741,15 @@ class ApiClient {
       String paymentMethod,
       List<CartItem> lines,
       int totalCents,
-      {int discountCents = 0,
+      {String? saleId,
+      int discountCents = 0,
       int paidCents = 0,
       int changeCents = 0,
       int debtCents = 0}) async {
     if (usesSupabase) {
       await _supabase.createSale(
           deviceUid, cashierId, customerId, paymentMethod, lines, totalCents,
+          saleId: saleId,
           discountCents: discountCents,
           paidCents: paidCents,
           changeCents: changeCents,
@@ -3569,11 +5777,56 @@ class ApiClient {
     });
   }
 
+  Future<void> updateSaleDebt(
+          String deviceUid, String saleId, int paidCents, int debtCents) =>
+      usesSupabase
+          ? _supabase.updateSaleDebt(deviceUid, saleId, paidCents, debtCents)
+          : Future.value();
+
   Future<Map<String, dynamic>> voidSale(
           String deviceUid, String? userId, SaleVoidRecord record) =>
       usesSupabase
           ? _supabase.voidSale(deviceUid, userId, record)
           : bootstrap(deviceUid);
+
+  Future<void> createAccountingEntry(String orgId, String branchId,
+      String deviceUid, AccountingEntry entry) async {
+    if (usesSupabase) {
+      await _supabase.createAccountingEntry(orgId, branchId, deviceUid, entry);
+    }
+  }
+
+  Future<void> deleteAccountingEntry(String deviceUid, String entryId) async {
+    if (usesSupabase) {
+      await _supabase.deleteAccountingEntry(deviceUid, entryId);
+    }
+  }
+
+  Future<void> deleteSales(String deviceUid, List<String> saleIds) async {
+    if (usesSupabase) {
+      await _supabase.deleteSales(deviceUid, saleIds);
+    }
+  }
+
+  Future<void> deleteCustomers(
+      String deviceUid, List<String> customerIds) async {
+    if (usesSupabase) {
+      await _supabase.deleteCustomers(deviceUid, customerIds);
+    }
+  }
+
+  Future<void> deleteStockTransfers(
+      String deviceUid, List<String> transferIds) async {
+    if (usesSupabase) {
+      await _supabase.deleteStockTransfers(deviceUid, transferIds);
+    }
+  }
+
+  Future<void> deleteSaleVoids(String deviceUid, List<String> voidIds) async {
+    if (usesSupabase) {
+      await _supabase.deleteSaleVoids(deviceUid, voidIds);
+    }
+  }
 
   Map<String, dynamic> _userBody(AppUser user) => {
         'name': user.name,
@@ -3806,6 +6059,8 @@ class SupabaseRetailApi {
         'lwr_users', {'organization_id': 'eq.$orgId', 'active': 'eq.true'});
     final products = await _select(
         'lwr_products', {'organization_id': 'eq.$orgId', 'active': 'eq.true'});
+    final productNameRows =
+        await _selectOptional('lwr_products', {'organization_id': 'eq.$orgId'});
     final stock = <Map<String, dynamic>>[];
     for (final branch in branches) {
       stock.addAll(await _select(
@@ -3813,6 +6068,13 @@ class SupabaseRetailApi {
     }
     final customers =
         await _select('lwr_customers', {'organization_id': 'eq.$orgId'});
+    List<Map<String, dynamic>>? suppliers;
+    try {
+      suppliers = await _select('lwr_suppliers',
+          {'organization_id': 'eq.$orgId', 'active': 'eq.true'});
+    } catch (_) {
+      suppliers = null;
+    }
     final activationCodes = await _select('lwr_activation_codes',
         {'organization_id': 'eq.$orgId', 'active': 'eq.true'});
     final licenses = await _select('lwr_licenses', {
@@ -3821,17 +6083,14 @@ class SupabaseRetailApi {
       'order': 'expires_at.desc'
     });
     final serverNow = await _serverNow();
-    final sales = await _select('lwr_sales', {
+    final sales = await _selectAll('lwr_sales', {
       'organization_id': 'eq.$orgId',
       'order': 'created_at.desc',
-      'limit': '200'
     });
     final saleIds = sales.map((sale) => '${sale['id']}').toList();
     final saleLineRows = saleIds.isEmpty
         ? <Map<String, dynamic>>[]
-        : await _selectOptional('lwr_sale_lines', {
-            'sale_id': 'in.(${saleIds.join(',')})',
-          });
+        : await _selectByIdsInChunks('lwr_sale_lines', 'sale_id', saleIds);
     final exchangeRows = await _selectOptional(
         'lwr_exchange_rates', {'organization_id': 'eq.$orgId'});
     final transferRows = await _selectOptional('lwr_stock_transfers', {
@@ -3839,17 +6098,19 @@ class SupabaseRetailApi {
       'order': 'created_at.desc',
       'limit': '100'
     });
-    final voidRows = await _selectOptional('lwr_sale_voids', {
+    final voidRows = await _selectAllOptional('lwr_sale_voids', {
       'organization_id': 'eq.$orgId',
       'order': 'created_at.desc',
-      'limit': '300'
     });
     final voidIds = voidRows.map((row) => '${row['id']}').toList();
     final voidLineRows = voidIds.isEmpty
         ? <Map<String, dynamic>>[]
-        : await _selectOptional('lwr_sale_void_lines', {
-            'void_id': 'in.(${voidIds.join(',')})',
-          });
+        : await _selectByIdsInChunks('lwr_sale_void_lines', 'void_id', voidIds);
+    final accountingRows = await _selectAllOptional('lwr_accounting_entries', {
+      'organization_id': 'eq.$orgId',
+      'active': 'eq.true',
+      'order': 'created_at.desc',
+    });
     final fiscalDays = await _selectOptional('lwr_fiscal_days', {
       'organization_id': 'eq.$orgId',
       'branch_id': 'eq.$branchId',
@@ -3867,28 +6128,45 @@ class SupabaseRetailApi {
         '${customer['id']}': '${customer['name']}'
     };
     final productNames = {
-      for (final product in products) '${product['id']}': '${product['name']}'
+      for (final product in productNameRows)
+        '${product['id']}': '${product['name']}',
+      for (final product in products) '${product['id']}': '${product['name']}',
     };
+    String productNameForLine(Map<String, dynamic> line) {
+      final explicit = '${line['name'] ?? line['product_name'] ?? ''}'.trim();
+      if (explicit.isNotEmpty && explicit.toLowerCase() != 'null') {
+        return explicit;
+      }
+      final productId = '${line['product_id'] ?? ''}';
+      return productNames[productId] ?? 'Unknown product';
+    }
+
     final linesBySale = <String, List<Map<String, dynamic>>>{};
     for (final line in saleLineRows) {
       final saleId = '${line['sale_id']}';
+      final lineName = productNameForLine(line);
       linesBySale.putIfAbsent(saleId, () => []).add({
         'productId': '${line['product_id'] ?? ''}',
-        'name': productNames['${line['product_id']}'] ?? 'Product',
+        'name': lineName,
         'quantity': line['quantity'] ?? 0,
         'unitPriceCents': line['unit_price_cents'] ?? 0,
         'lineTotalCents': line['line_total_cents'] ?? 0,
+        'unitCostCents': line['unit_cost_cents'] ?? 0,
+        'lineCostCents': line['line_cost_cents'] ?? 0,
       });
     }
     final linesByVoid = <String, List<Map<String, dynamic>>>{};
     for (final line in voidLineRows) {
       final voidId = '${line['void_id']}';
+      final lineName = productNameForLine(line);
       linesByVoid.putIfAbsent(voidId, () => []).add({
         'productId': '${line['product_id'] ?? ''}',
-        'name': productNames['${line['product_id']}'] ?? 'Product',
+        'name': lineName,
         'quantity': line['quantity'] ?? 0,
         'unitPriceCents': line['unit_price_cents'] ?? 0,
         'lineTotalCents': line['line_total_cents'] ?? 0,
+        'unitCostCents': line['unit_cost_cents'] ?? 0,
+        'lineCostCents': line['line_cost_cents'] ?? 0,
       });
     }
     final licenseLabel = licenses.isEmpty ? 'Not licensed' : 'Licensed';
@@ -3943,8 +6221,11 @@ class SupabaseRetailApi {
                 'name': p['name'],
                 'sku': p['sku'],
                 'barcode': p['barcode'] ?? '',
+                'category': p['category'] ?? '',
                 'price_cents': p['price_cents'],
-                'reorder_level': p['reorder_level']
+                'cost_price_cents': p['cost_price_cents'] ?? 0,
+                'reorder_level': p['reorder_level'],
+                'supplier_id': p['supplier_id'] ?? ''
               })
           .toList(),
       'stock': stock
@@ -3958,6 +6239,15 @@ class SupabaseRetailApi {
           .map((c) =>
               {'id': c['id'], 'name': c['name'], 'phone': c['phone'] ?? ''})
           .toList(),
+      if (suppliers != null)
+        'suppliers': suppliers
+            .map((s) => {
+                  'id': s['id'],
+                  'name': s['name'],
+                  'phone': s['phone'] ?? '',
+                  'notes': s['notes'] ?? ''
+                })
+            .toList(),
       'sales': sales
           .map((s) => {
                 'id': s['id'],
@@ -4006,6 +6296,7 @@ class SupabaseRetailApi {
                     'User',
               })
           .toList(),
+      'accounting_entries': accountingRows,
       'activation_codes': activationCodes
           .map((c) => {'branch_id': c['branch_id'], 'code': c['code']})
           .toList(),
@@ -4293,22 +6584,134 @@ class SupabaseRetailApi {
 
   Future<Map<String, dynamic>> createProduct(
       String orgId, String branchId, String deviceUid, Product product) async {
+    final existing = await _findExistingProductById(orgId, product.id);
+    if (existing != null) {
+      product.id = '${existing['id']}';
+      return updateProduct(deviceUid, branchId, product);
+    }
     await _insert('lwr_products', {
       'id': product.id,
       'organization_id': orgId,
       'name': product.name,
+      'category': product.category,
       'sku': product.sku,
       'barcode': product.barcode,
       'price_cents': product.priceCents,
+      'cost_price_cents': product.costCents,
       'reorder_level': product.reorderLevel,
+      'supplier_id':
+          product.supplierId.trim().isEmpty ? null : product.supplierId,
       'active': true
-    });
-    await _insert('lwr_branch_stock', {
-      'branch_id': branchId,
-      'product_id': product.id,
-      'quantity': product.stock
-    });
-    return bootstrap(deviceUid);
+    }).catchError((_) => _insert('lwr_products', {
+          'id': product.id,
+          'organization_id': orgId,
+          'name': product.name,
+          'sku': product.sku,
+          'barcode': product.barcode,
+          'price_cents': product.priceCents,
+          'reorder_level': product.reorderLevel,
+          'active': true
+        }));
+    await _upsertBranchStock(branchId, product.id, product.stock);
+    return <String, dynamic>{};
+  }
+
+  Future<Map<String, dynamic>> upsertProduct(
+      String orgId, String branchId, String deviceUid, Product product) async {
+    final existing = await _findExistingProductById(orgId, product.id);
+    if (existing == null) {
+      return createProduct(orgId, branchId, deviceUid, product);
+    }
+    product.id = '${existing['id']}';
+    return updateProduct(deviceUid, branchId, product);
+  }
+
+  Future<Map<String, dynamic>> upsertProducts(String orgId, String branchId,
+      String deviceUid, List<Product> products) async {
+    if (products.isEmpty) return <String, dynamic>{};
+    final existingRows =
+        await _selectOptional('lwr_products', {'organization_id': 'eq.$orgId'});
+    final byId = <String, Map<String, dynamic>>{};
+    for (final row in existingRows) {
+      final id = '${row['id'] ?? ''}';
+      if (id.isNotEmpty) byId[id] = row;
+    }
+    for (final product in products) {
+      final existing = byId[product.id];
+      if (existing == null) {
+        await _insertProductRow(orgId, product);
+        byId[product.id] = {
+          'id': product.id,
+          'sku': product.sku,
+          'name': product.name
+        };
+      } else {
+        product.id = '${existing['id']}';
+        await _patchProductRow(product);
+      }
+      await _upsertBranchStock(branchId, product.id, product.stock);
+    }
+    return <String, dynamic>{};
+  }
+
+  Future<void> _insertProductRow(String orgId, Product product) async {
+    await _insert('lwr_products', {
+      'id': product.id,
+      'organization_id': orgId,
+      'name': product.name,
+      'category': product.category,
+      'sku': product.sku,
+      'barcode': product.barcode,
+      'price_cents': product.priceCents,
+      'cost_price_cents': product.costCents,
+      'reorder_level': product.reorderLevel,
+      'supplier_id':
+          product.supplierId.trim().isEmpty ? null : product.supplierId,
+      'active': true
+    }).catchError((_) => _insert('lwr_products', {
+          'id': product.id,
+          'organization_id': orgId,
+          'name': product.name,
+          'sku': product.sku,
+          'barcode': product.barcode,
+          'price_cents': product.priceCents,
+          'reorder_level': product.reorderLevel,
+          'active': true
+        }));
+  }
+
+  Future<void> _patchProductRow(Product product) async {
+    await _patch('lwr_products', {
+      'id': 'eq.${product.id}'
+    }, {
+      'name': product.name,
+      'category': product.category,
+      'sku': product.sku,
+      'barcode': product.barcode,
+      'price_cents': product.priceCents,
+      'cost_price_cents': product.costCents,
+      'reorder_level': product.reorderLevel,
+      'supplier_id':
+          product.supplierId.trim().isEmpty ? null : product.supplierId,
+      'active': true
+    }).catchError((_) => _patch('lwr_products', {
+          'id': 'eq.${product.id}'
+        }, {
+          'name': product.name,
+          'sku': product.sku,
+          'barcode': product.barcode,
+          'price_cents': product.priceCents,
+          'reorder_level': product.reorderLevel,
+          'active': true
+        }));
+  }
+
+  Future<Map<String, dynamic>?> _findExistingProductById(
+      String orgId, String productId) async {
+    final byId = await _selectOptional('lwr_products',
+        {'organization_id': 'eq.$orgId', 'id': 'eq.$productId', 'limit': '1'});
+    if (byId.isNotEmpty) return byId.first;
+    return null;
   }
 
   Future<Map<String, dynamic>> updateProduct(
@@ -4317,26 +6720,85 @@ class SupabaseRetailApi {
       'id': 'eq.${product.id}'
     }, {
       'name': product.name,
+      'category': product.category,
       'sku': product.sku,
       'barcode': product.barcode,
       'price_cents': product.priceCents,
+      'cost_price_cents': product.costCents,
       'reorder_level': product.reorderLevel,
+      'supplier_id':
+          product.supplierId.trim().isEmpty ? null : product.supplierId,
       'active': true
-    });
-    await _patch('lwr_branch_stock', {
-      'branch_id': 'eq.$branchId',
-      'product_id': 'eq.${product.id}'
+    }).catchError((_) => _patch('lwr_products', {
+          'id': 'eq.${product.id}'
+        }, {
+          'name': product.name,
+          'sku': product.sku,
+          'barcode': product.barcode,
+          'price_cents': product.priceCents,
+          'reorder_level': product.reorderLevel,
+          'active': true
+        }));
+    await _upsertBranchStock(branchId, product.id, product.stock);
+    return <String, dynamic>{};
+  }
+
+  Future<void> _upsertBranchStock(
+      String branchId, String productId, int quantity) async {
+    final existing = await _selectOptional('lwr_branch_stock',
+        {'branch_id': 'eq.$branchId', 'product_id': 'eq.$productId'});
+    final row = {
+      'branch_id': branchId,
+      'product_id': productId,
+      'quantity': quantity,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    };
+    if (existing.isEmpty) {
+      await _insert('lwr_branch_stock', row);
+    } else {
+      await _patch('lwr_branch_stock',
+          {'branch_id': 'eq.$branchId', 'product_id': 'eq.$productId'}, row);
+    }
+  }
+
+  Future<Map<String, dynamic>> upsertSupplier(
+      String orgId, String deviceUid, Supplier supplier,
+      {bool refresh = true}) async {
+    final row = {
+      'id': supplier.id,
+      'organization_id': orgId,
+      'name': supplier.name,
+      'phone': supplier.phone,
+      'notes': supplier.notes,
+      'active': true,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    };
+    final existing =
+        await _selectOptional('lwr_suppliers', {'id': 'eq.${supplier.id}'});
+    if (existing.isEmpty) {
+      await _insert('lwr_suppliers', row);
+    } else {
+      await _patch('lwr_suppliers', {'id': 'eq.${supplier.id}'}, row);
+    }
+    return refresh ? bootstrap(deviceUid) : <String, dynamic>{};
+  }
+
+  Future<Map<String, dynamic>> deleteSupplier(
+      String deviceUid, String supplierId) async {
+    await _patchOptional('lwr_suppliers', {
+      'id': 'eq.$supplierId'
     }, {
-      'quantity': product.stock,
-      'updated_at': DateTime.now().toUtc().toIso8601String()
+      'active': false,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
     });
     return bootstrap(deviceUid);
   }
 
   Future<Map<String, dynamic>> deleteProduct(
       String deviceUid, String productId) async {
+    await _deleteRows('lwr_branch_stock', {'product_id': 'eq.$productId'});
     await _patch('lwr_products', {'id': 'eq.$productId'}, {'active': false});
-    return bootstrap(deviceUid);
+    return <String, dynamic>{};
   }
 
   Future<Map<String, dynamic>> createCustomer(
@@ -4367,7 +6829,8 @@ class SupabaseRetailApi {
       String paymentMethod,
       List<CartItem> lines,
       int totalCents,
-      {int discountCents = 0,
+      {String? saleId,
+      int discountCents = 0,
       int paidCents = 0,
       int changeCents = 0,
       int debtCents = 0}) async {
@@ -4379,9 +6842,12 @@ class SupabaseRetailApi {
         'lwr_organizations', {'id': 'eq.${device['organization_id']}'});
     final fiscalMode =
         orgRows.isNotEmpty && orgRows.first['fiscal_mode'] == true;
-    final saleId = newId();
+    final actualSaleId = saleId ?? newId();
+    final existingSale =
+        await _selectOptional('lwr_sales', {'id': 'eq.$actualSaleId'});
+    if (existingSale.isNotEmpty) return;
     await _insert('lwr_sales', {
-      'id': saleId,
+      'id': actualSaleId,
       'organization_id': device['organization_id'],
       'branch_id': device['branch_id'],
       'device_uid': deviceUid,
@@ -4396,23 +6862,54 @@ class SupabaseRetailApi {
       'fiscal_status': fiscalMode ? 'pending' : 'not_required'
     });
     for (final item in lines) {
-      await _insert('lwr_sale_lines', {
+      if (item.product.isCustom) {
+        await _insertOptional('lwr_products', {
+          'id': item.product.id,
+          'organization_id': device['organization_id'],
+          'name': item.product.name,
+          'category': item.product.category,
+          'sku': '',
+          'barcode': '',
+          'price_cents': item.product.priceCents,
+          'cost_price_cents': item.product.costCents,
+          'reorder_level': 0,
+          'active': false
+        });
+      }
+      final saleLineBody = {
         'id': newId(),
-        'sale_id': saleId,
+        'sale_id': actualSaleId,
         'product_id': item.product.id,
+        'product_name': item.product.name,
         'quantity': item.quantity,
         'unit_price_cents': item.product.priceCents,
-        'line_total_cents': item.product.priceCents * item.quantity
-      });
-      await _rpcAdjustStock(
-          device['branch_id'], item.product.id, -item.quantity);
+        'line_total_cents': item.product.priceCents * item.quantity,
+        'unit_cost_cents': item.product.costCents,
+        'line_cost_cents': item.product.costCents * item.quantity,
+      };
+      try {
+        await _insert('lwr_sale_lines', saleLineBody);
+      } catch (_) {
+        await _insert(
+            'lwr_sale_lines',
+            {
+              ...saleLineBody,
+            }..removeWhere((key, value) =>
+                key == 'unit_cost_cents' ||
+                key == 'line_cost_cents' ||
+                key == 'product_name'));
+      }
+      if (!item.product.isCustom) {
+        await _rpcAdjustStock(
+            device['branch_id'], item.product.id, -item.quantity);
+      }
     }
     if (fiscalMode) {
       await _insertOptional('lwr_fiscal_submissions', {
         'id': newId(),
         'organization_id': device['organization_id'],
         'branch_id': device['branch_id'],
-        'sale_id': saleId,
+        'sale_id': actualSaleId,
         'submission_type': 'fiscal_invoice',
         'status': 'pending',
         'attempt_count': 0,
@@ -4420,6 +6917,19 @@ class SupabaseRetailApi {
         'created_at': DateTime.now().toUtc().toIso8601String()
       });
     }
+  }
+
+  Future<void> updateSaleDebt(
+      String deviceUid, String saleId, int paidCents, int debtCents) async {
+    final devices = await _select(
+        'lwr_devices', {'device_uid': 'eq.$deviceUid', 'active': 'eq.true'});
+    if (devices.isEmpty) throw StateError('Device not activated.');
+    await _patch('lwr_sales', {
+      'id': 'eq.$saleId'
+    }, {
+      'paid_cents': paidCents,
+      'debt_cents': debtCents,
+    });
   }
 
   Future<Map<String, dynamic>> voidSale(
@@ -4444,14 +6954,29 @@ class SupabaseRetailApi {
     });
     for (final line in record.lines) {
       if (line.productId.trim().isEmpty) continue;
-      await _insertOptional('lwr_sale_void_lines', {
+      final voidLineBody = {
         'id': newId(),
         'void_id': record.id,
         'product_id': line.productId,
+        'product_name': line.name,
         'quantity': line.quantity,
         'unit_price_cents': line.unitPriceCents,
         'line_total_cents': line.lineTotalCents,
-      });
+        'unit_cost_cents': line.unitCostCents,
+        'line_cost_cents': line.lineCostCents,
+      };
+      try {
+        await _insert('lwr_sale_void_lines', voidLineBody);
+      } catch (_) {
+        await _insertOptional(
+            'lwr_sale_void_lines',
+            {
+              ...voidLineBody,
+            }..removeWhere((key, value) =>
+                key == 'unit_cost_cents' ||
+                key == 'line_cost_cents' ||
+                key == 'product_name'));
+      }
       await _rpcAdjustStock(
           record.branchId.isEmpty ? device['branch_id'] : record.branchId,
           line.productId,
@@ -4472,6 +6997,51 @@ class SupabaseRetailApi {
       }
     });
     return bootstrap(deviceUid);
+  }
+
+  Future<void> createAccountingEntry(String orgId, String branchId,
+      String deviceUid, AccountingEntry entry) async {
+    await _insertOptional('lwr_accounting_entries', {
+      'id': entry.id,
+      'organization_id': orgId,
+      'branch_id': branchId.trim().isEmpty ? null : branchId,
+      'device_uid': deviceUid,
+      'type': entry.typeText,
+      'category': entry.category,
+      'description': entry.description,
+      'amount_cents': entry.amountCents,
+      'payment_method': entry.paymentMethod,
+      'counterparty': entry.counterparty,
+      'active': true,
+      'created_at': entry.createdAt.toUtc().toIso8601String(),
+    });
+  }
+
+  Future<void> deleteAccountingEntry(String deviceUid, String entryId) async {
+    await _patchOptional('lwr_accounting_entries', {
+      'id': 'eq.$entryId'
+    }, {
+      'active': false,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    });
+  }
+
+  Future<void> deleteSales(String deviceUid, List<String> saleIds) async {
+    await _deleteIdsInChunks('lwr_sales', saleIds);
+  }
+
+  Future<void> deleteCustomers(
+      String deviceUid, List<String> customerIds) async {
+    await _deleteIdsInChunks('lwr_customers', customerIds);
+  }
+
+  Future<void> deleteStockTransfers(
+      String deviceUid, List<String> transferIds) async {
+    await _deleteIdsInChunks('lwr_stock_transfers', transferIds);
+  }
+
+  Future<void> deleteSaleVoids(String deviceUid, List<String> voidIds) async {
+    await _deleteIdsInChunks('lwr_sale_voids', voidIds);
   }
 
   Map<String, dynamic> _userRow(String orgId, AppUser user) => {
@@ -4511,9 +7081,8 @@ class SupabaseRetailApi {
       String table, Map<String, String> query) async {
     final uri = Uri.parse('$restUrl/$table')
         .replace(queryParameters: {'select': '*', ...query});
-    final response = await http
-        .get(uri, headers: _headers)
-        .timeout(requestTimeout);
+    final response =
+        await http.get(uri, headers: _headers).timeout(requestTimeout);
     return _list(response);
   }
 
@@ -4524,6 +7093,48 @@ class SupabaseRetailApi {
     } catch (_) {
       return [];
     }
+  }
+
+  Future<List<Map<String, dynamic>>> _selectAll(
+      String table, Map<String, String> query,
+      {int pageSize = 1000}) async {
+    final rows = <Map<String, dynamic>>[];
+    var offset = 0;
+    while (true) {
+      final page = await _select(table, {
+        ...query,
+        'limit': '$pageSize',
+        'offset': '$offset',
+      });
+      rows.addAll(page);
+      if (page.length < pageSize) break;
+      offset += pageSize;
+    }
+    return rows;
+  }
+
+  Future<List<Map<String, dynamic>>> _selectAllOptional(
+      String table, Map<String, String> query,
+      {int pageSize = 1000}) async {
+    try {
+      return await _selectAll(table, query, pageSize: pageSize);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _selectByIdsInChunks(
+      String table, String column, List<String> ids,
+      {Map<String, String> query = const {}, int chunkSize = 80}) async {
+    final rows = <Map<String, dynamic>>[];
+    for (var start = 0; start < ids.length; start += chunkSize) {
+      final chunk = ids.skip(start).take(chunkSize).toList();
+      rows.addAll(await _selectOptional(table, {
+        ...query,
+        column: 'in.(${chunk.join(',')})',
+      }));
+    }
+    return rows;
   }
 
   Future<Map<String, dynamic>> _insert(
@@ -4556,6 +7167,25 @@ class SupabaseRetailApi {
     try {
       await _patch(table, query, body);
     } catch (_) {}
+  }
+
+  Future<void> _deleteRows(String table, Map<String, String> query) async {
+    final uri = Uri.parse('$restUrl/$table').replace(queryParameters: query);
+    final response =
+        await http.delete(uri, headers: _headers).timeout(requestTimeout);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError('${response.statusCode}: ${response.body}');
+    }
+  }
+
+  Future<void> _deleteIdsInChunks(String table, List<String> ids,
+      {int chunkSize = 80}) async {
+    final cleanIds =
+        ids.map((id) => id.trim()).where((id) => id.isNotEmpty).toList();
+    for (var start = 0; start < cleanIds.length; start += chunkSize) {
+      final chunk = cleanIds.skip(start).take(chunkSize).toList();
+      await _deleteRows(table, {'id': 'in.(${chunk.join(',')})'});
+    }
   }
 
   Future<dynamic> _rpc(String functionName, Map<String, dynamic> body) async {
@@ -4631,6 +7261,7 @@ bool isDuplicateKeyError(Object error) {
       message.contains('duplicate') ||
       message.contains('unique constraint');
 }
+
 String _newDeviceUid() => 'LWR-${Random.secure().nextInt(900000) + 100000}';
 String money(int cents) => '\$${(cents / 100).toStringAsFixed(2)}';
 
@@ -4638,11 +7269,36 @@ extension ListFallback<T> on List<T> {
   List<T> ifEmpty(List<T> fallback) => isEmpty ? [...fallback] : this;
 }
 
+List<T> mergeById<T>(
+    List<T> localItems, List<T> cloudItems, String Function(T item) idOf) {
+  final merged = <String, T>{};
+  for (final item in localItems) {
+    final id = idOf(item);
+    if (id.trim().isNotEmpty) merged[id] = item;
+  }
+  for (final item in cloudItems) {
+    final id = idOf(item);
+    if (id.trim().isNotEmpty) merged[id] = item;
+  }
+  return merged.values.toList();
+}
+
 String localDateKey(DateTime value) {
   final local = value.toLocal();
   String two(int number) => number.toString().padLeft(2, '0');
   return '${local.year}-${two(local.month)}-${two(local.day)}';
 }
+
+DateTime businessTime(DateTime value) =>
+    value.toUtc().add(const Duration(hours: 2));
+
+DateTime businessDate(DateTime value) {
+  final business = businessTime(value);
+  return DateTime(business.year, business.month, business.day);
+}
+
+bool sameBusinessDay(DateTime a, DateTime b) =>
+    businessDate(a) == businessDate(b);
 
 String formatReceiptDate(DateTime value) {
   final local = value.toLocal();
@@ -4724,6 +7380,12 @@ String paymentMethodLabel(String value) {
   };
 }
 
+String customerShortCode(String value) {
+  final clean =
+      value.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '').padRight(6, '0');
+  return 'C-${clean.substring(max(0, clean.length - 6))}';
+}
+
 String formatLicenseCountdown(DateTime? expiresAt, {DateTime? nowUtc}) {
   if (expiresAt == null) return 'Not licensed';
   final remaining =
@@ -4760,37 +7422,61 @@ class BusyOverlay extends StatelessWidget {
           child: AbsorbPointer(
             absorbing: true,
             child: ColoredBox(
-              color: Colors.black.withValues(alpha: 0.18),
-              child: Center(
-                child: Container(
-                  width: min(MediaQuery.sizeOf(context).width - 40, 360),
-                  padding: const EdgeInsets.all(18),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(8),
-                    boxShadow: const [
-                      BoxShadow(
-                          color: Color(0x24000000),
-                          blurRadius: 22,
-                          offset: Offset(0, 10))
-                    ],
+              color: Colors.black.withValues(alpha: 0.28),
+              child: SafeArea(
+                child: Stack(children: [
+                  Align(
+                    alignment: Alignment.topCenter,
+                    child: LinearProgressIndicator(
+                      minHeight: 4,
+                      backgroundColor: Colors.white.withValues(alpha: 0.35),
+                    ),
                   ),
-                  child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    const SizedBox(
-                      width: 24,
-                      height: 24,
-                      child: CircularProgressIndicator(strokeWidth: 3),
-                    ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Text(
-                        store.busyMessage ?? 'Working...',
-                        style: const TextStyle(
-                            fontWeight: FontWeight.w900, fontSize: 15),
+                  Center(
+                    child: Container(
+                      width: min(MediaQuery.sizeOf(context).width - 32, 420),
+                      padding: const EdgeInsets.all(18),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: const Color(0xFF0B7D72)),
+                        boxShadow: const [
+                          BoxShadow(
+                              color: Color(0x33000000),
+                              blurRadius: 24,
+                              offset: Offset(0, 12))
+                        ],
                       ),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        const SizedBox(
+                          width: 28,
+                          height: 28,
+                          child: CircularProgressIndicator(strokeWidth: 3),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                store.busyMessage ?? 'Working...',
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w900, fontSize: 16),
+                              ),
+                              const SizedBox(height: 4),
+                              const Text(
+                                'Please wait. Do not tap again.',
+                                style: TextStyle(
+                                    fontSize: 12, color: Color(0xFF4B5A57)),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ]),
                     ),
-                  ]),
-                ),
+                  ),
+                ]),
               ),
             ),
           ),
@@ -4799,12 +7485,70 @@ class BusyOverlay extends StatelessWidget {
   }
 }
 
-class StartScreen extends StatelessWidget {
+class StartScreen extends StatefulWidget {
   const StartScreen({required this.store, super.key});
   final AppStore store;
 
   @override
+  State<StartScreen> createState() => _StartScreenState();
+}
+
+class _StartScreenState extends State<StartScreen> {
+  String status =
+      'If this device was already in a shop, recover it from cloud first. Do not create a new shop unless this is a brand-new customer.';
+  Tone tone = Tone.warning;
+
+  Future<void> _recoverPreviousDeviceId() async {
+    final controller = TextEditingController(text: 'LWR-');
+    final previousId = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Use Previous Device ID'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          textCapitalization: TextCapitalization.characters,
+          decoration: const InputDecoration(
+            labelText: 'Old Device ID',
+            hintText: 'LWR-123456',
+            helperText: 'Use the licensed ID already saved in Supabase.',
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, controller.text),
+              child: const Text('Recover')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (previousId == null || previousId.trim().isEmpty) return;
+    setState(() {
+      status = 'Recovering ${previousId.trim().toUpperCase()}...';
+      tone = Tone.warning;
+    });
+    try {
+      await widget.store.recoverPreviousDeviceIdFromCloud(previousId);
+      if (!mounted) return;
+      setState(() {
+        status = 'Previous Device ID restored. Continue with login.';
+        tone = Tone.good;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        status = 'Could not recover previous ID: ${cleanError(error)}';
+        tone = Tone.danger;
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final store = widget.store;
     return Scaffold(
       body: Center(
         child: ConstrainedBox(
@@ -4830,23 +7574,59 @@ class StartScreen extends StatelessWidget {
                 const Text(
                     'Choose how this device should enter the shop system.'),
                 const SizedBox(height: 18),
+                DeviceIdCard(deviceUid: store.deviceUid),
+                const SizedBox(height: 12),
+                SetupStatusBanner(text: status, tone: tone, busy: false),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: () async {
+                    setState(() {
+                      status = 'Checking Supabase for this device...';
+                      tone = Tone.warning;
+                    });
+                    try {
+                      await store.recoverCurrentDeviceFromCloud();
+                      if (!mounted) return;
+                      setState(() {
+                        status = 'Device recovered. Continue with login.';
+                        tone = Tone.good;
+                      });
+                    } catch (error) {
+                      if (!mounted) return;
+                      setState(() {
+                        status =
+                            'Could not recover this device ID: ${cleanError(error)}';
+                        tone = Tone.danger;
+                      });
+                    }
+                  },
+                  icon: const Icon(Icons.cloud_sync),
+                  label: const Text('Recover This Device From Cloud'),
+                ),
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
+                  onPressed: _recoverPreviousDeviceId,
+                  icon: const Icon(Icons.badge),
+                  label: const Text('Use Previous Device ID'),
+                ),
+                const SizedBox(height: 10),
                 FilledButton.icon(
                   onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-                      builder: (_) => SetupScreen(store: store))),
+                      builder: (_) => SetupScreen(store: widget.store))),
                   icon: const Icon(Icons.storefront),
                   label: const Text('Create New Shop as Owner'),
                 ),
                 const SizedBox(height: 10),
                 OutlinedButton.icon(
                   onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-                      builder: (_) => JoinShopScreen(store: store))),
+                      builder: (_) => JoinShopScreen(store: widget.store))),
                   icon: const Icon(Icons.link),
                   label: const Text('Join Existing Shop / Branch'),
                 ),
                 const SizedBox(height: 10),
                 OutlinedButton.icon(
                   onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-                      builder: (_) => RecoverShopScreen(store: store))),
+                      builder: (_) => RecoverShopScreen(store: widget.store))),
                   icon: const Icon(Icons.restore),
                   label: const Text('Recover Existing Shop as Owner'),
                 ),
@@ -5767,6 +8547,7 @@ class _RetailShellState extends State<RetailShell> {
               icon: const Icon(Icons.logout),
               tooltip: 'Logout'),
         ],
+        bottom: BranchTopSwitcher(store: store),
       ),
       body: Row(
         children: [
@@ -5834,6 +8615,101 @@ int _bottomIndex(List<AppNavItem> nav, int selectedIndex) {
   return bottomIndex >= 0 ? bottomIndex : 0;
 }
 
+class BranchTopSwitcher extends StatelessWidget implements PreferredSizeWidget {
+  const BranchTopSwitcher({required this.store, super.key});
+  final AppStore store;
+
+  @override
+  Size get preferredSize => const Size.fromHeight(48);
+
+  @override
+  Widget build(BuildContext context) {
+    final branches = store.accessibleBranches;
+    final current = store.currentBranch;
+    if (current == null) return const SizedBox.shrink();
+    final selectedId = branches.any((branch) => branch.id == current.id)
+        ? current.id
+        : branches.firstOrNull?.id;
+    return Container(
+      height: preferredSize.height,
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        border: Border(
+          top: BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
+          bottom:
+              BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
+        ),
+      ),
+      child: Row(children: [
+        Icon(Icons.storefront,
+            size: 20, color: Theme.of(context).colorScheme.primary),
+        const SizedBox(width: 8),
+        const Text('Branch',
+            style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12)),
+        const SizedBox(width: 10),
+        Expanded(
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: selectedId,
+              isExpanded: true,
+              icon: const Icon(Icons.keyboard_arrow_down),
+              items: branches
+                  .map((branch) => DropdownMenuItem(
+                        value: branch.id,
+                        child: Text(
+                          branch.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                      ))
+                  .toList(),
+              onChanged: branches.length < 2
+                  ? null
+                  : (branchId) async {
+                      if (branchId == null ||
+                          branchId == store.assignedBranchId) {
+                        return;
+                      }
+                      final branch = branches
+                          .where((item) => item.id == branchId)
+                          .firstOrNull;
+                      if (branch == null) return;
+                      if (store.hasOpenCartItems) {
+                        final confirmed = await confirmDanger(
+                            context,
+                            'Switch branch?',
+                            'Open POS carts will be cleared before switching to ${branch.name}.');
+                        if (!confirmed) return;
+                      }
+                      try {
+                        await store.assignDeviceToBranch(branch);
+                        if (context.mounted) {
+                          showMessage(
+                              context, 'Now operating as ${branch.name}');
+                        }
+                      } catch (error) {
+                        if (context.mounted)
+                          showMessage(context, cleanError(error));
+                      }
+                    },
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Tooltip(
+          message:
+              'Only branches assigned to this user are shown. Owner/all-privilege users see every branch.',
+          child: Icon(Icons.verified_user,
+              size: 18, color: Theme.of(context).colorScheme.primary),
+        ),
+      ]),
+    );
+  }
+}
+
 class AppNavItem {
   AppNavItem({required this.label, required this.icon, required this.page});
   final String label;
@@ -5849,6 +8725,11 @@ List<AppNavItem> appNavItems(AppStore store) {
         label: 'Home',
         icon: Icons.dashboard,
         page: DashboardPage(store: store)));
+  if (user.can(AppPermission.profit))
+    items.add(AppNavItem(
+        label: 'Profit',
+        icon: Icons.account_balance,
+        page: ProfitLossPage(store: store)));
   if (user.can(AppPermission.pos))
     items.add(AppNavItem(
         label: 'POS', icon: Icons.point_of_sale, page: PosPage(store: store)));
@@ -6161,6 +9042,10 @@ class _DashboardPageState extends State<DashboardPage> {
       children: [
         MetricGrid(store: store, report: report),
         const SizedBox(height: 16),
+        SmartInsightsPanel(
+            store: store,
+            insights: store.smartInsights(report, allBranches: allBranches)),
+        const SizedBox(height: 16),
         DecoratedPanel(
           child:
               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -6183,6 +9068,10 @@ class _DashboardPageState extends State<DashboardPage> {
                       value: 'monthly',
                       icon: Icon(Icons.calendar_month),
                       label: Text('Monthly')),
+                  ButtonSegment(
+                      value: 'yearly',
+                      icon: Icon(Icons.event_note),
+                      label: Text('Yearly')),
                 ],
                 selected: {period},
                 onSelectionChanged: (value) =>
@@ -6200,18 +9089,33 @@ class _DashboardPageState extends State<DashboardPage> {
                   ? 'Uses synced sales from every branch/device in this shop.'
                   : 'Uses this branch only: ${store.currentBranch?.name ?? 'current branch'}'),
             ),
+            const SizedBox(height: 6),
+            CurrencyChoiceRow(
+              label: 'Report currency',
+              selected: store.displayCurrency,
+              onSelected: store.setDisplayCurrency,
+            ),
             const SizedBox(height: 8),
             Wrap(spacing: 8, runSpacing: 8, children: [
               FilledButton.icon(
                   onPressed: () async {
                     await ReceiptOutputService.sharePdf(
                         store.reportText(report, allBranches: allBranches),
-                        filename: 'light-winter-${period}-report.pdf');
+                        filename: 'light-winter-${period}-report.pdf',
+                        brandedReport: true);
                     if (context.mounted)
                       showMessage(context, 'Report PDF ready to share');
                   },
                   icon: const Icon(Icons.picture_as_pdf),
-                  label: const Text('PDF / WhatsApp')),
+                  label: const Text('PDF / WhatsApp / Bluetooth')),
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    await ReceiptOutputService.printNative(
+                        store.reportText(report, allBranches: allBranches),
+                        brandedReport: true);
+                  },
+                  icon: const Icon(Icons.print),
+                  label: const Text('Print')),
               OutlinedButton.icon(
                   onPressed: () async {
                     await launchUrl(
@@ -6229,6 +9133,21 @@ class _DashboardPageState extends State<DashboardPage> {
                   },
                   icon: const Icon(Icons.cloud_sync),
                   label: const Text('Sync Cloud')),
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    final confirmed = await confirmTypedDelete(
+                        context,
+                        'Delete report history?',
+                        allBranches
+                            ? 'Type DELETE REPORTS to permanently delete all synced sales, debts, voids, and report history for this shop.'
+                            : 'Type DELETE REPORTS to permanently delete sales, debts, voids, and report history for this branch.',
+                        'DELETE REPORTS');
+                    if (!confirmed) return;
+                    await store.deleteAllReportHistory(
+                        allBranches: allBranches);
+                  },
+                  icon: const Icon(Icons.delete_sweep),
+                  label: const Text('Delete Reports')),
             ]),
           ]),
         ),
@@ -6238,6 +9157,8 @@ class _DashboardPageState extends State<DashboardPage> {
         UserPerformancePanel(store: store, report: report),
         const SizedBox(height: 16),
         ProductPerformancePanel(store: store, report: report),
+        const SizedBox(height: 16),
+        TransactionDetailPanel(store: store, report: report),
         const SizedBox(height: 16),
         BackupPanel(store: store),
         const SizedBox(height: 16),
@@ -6271,49 +9192,821 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 }
 
+class ProfitLossPage extends StatefulWidget {
+  const ProfitLossPage({required this.store, super.key});
+  final AppStore store;
+
+  @override
+  State<ProfitLossPage> createState() => _ProfitLossPageState();
+}
+
+class _ProfitLossPageState extends State<ProfitLossPage> {
+  String period = 'daily';
+  bool allBranches = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final store = widget.store;
+    final statement =
+        store.profitLossStatement(period, allBranches: allBranches);
+    return PageFrame(
+      title: 'Profit and Loss',
+      children: [
+        DecoratedPanel(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Accounting Controls',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 10),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment(
+                      value: 'daily',
+                      icon: Icon(Icons.today),
+                      label: Text('Daily')),
+                  ButtonSegment(
+                      value: 'weekly',
+                      icon: Icon(Icons.view_week),
+                      label: Text('Weekly')),
+                  ButtonSegment(
+                      value: 'monthly',
+                      icon: Icon(Icons.calendar_month),
+                      label: Text('Monthly')),
+                  ButtonSegment(
+                      value: 'yearly',
+                      icon: Icon(Icons.event_note),
+                      label: Text('Yearly')),
+                ],
+                selected: {period},
+                onSelectionChanged: (value) =>
+                    setState(() => period = value.first),
+              ),
+            ),
+            const SizedBox(height: 10),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              value: allBranches,
+              onChanged: (value) => setState(() => allBranches = value),
+              title: const Text('All branches P/L',
+                  style: TextStyle(fontWeight: FontWeight.w800)),
+              subtitle: Text(allBranches
+                  ? 'Uses synced sales, stock costs, expenses, and income from all branches.'
+                  : 'Uses this branch only: ${store.currentBranch?.name ?? 'current branch'}'),
+            ),
+            const SizedBox(height: 6),
+            CurrencyChoiceRow(
+              label: 'Accounting currency',
+              selected: store.displayCurrency,
+              onSelected: store.setDisplayCurrency,
+            ),
+            const SizedBox(height: 8),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              FilledButton.icon(
+                  onPressed: () => showAccountingEntryDialog(context, store,
+                      type: AccountingEntryType.expense),
+                  icon: const Icon(Icons.receipt_long),
+                  label: const Text('Add Expense')),
+              FilledButton.icon(
+                  onPressed: () => showStockPurchaseDialog(context, store),
+                  icon: const Icon(Icons.add_shopping_cart),
+                  label: const Text('Stock Purchase')),
+              OutlinedButton.icon(
+                  onPressed: () => showPurchaseOrderDialog(context, store),
+                  icon: const Icon(Icons.assignment),
+                  label: const Text('Purchase Order')),
+              OutlinedButton.icon(
+                  onPressed: () => showStockCountDialog(context, store),
+                  icon: const Icon(Icons.fact_check),
+                  label: const Text('Stock Count')),
+              OutlinedButton.icon(
+                  onPressed: () => showAccountingEntryDialog(context, store,
+                      type: AccountingEntryType.income),
+                  icon: const Icon(Icons.add_card),
+                  label: const Text('Add Income')),
+              OutlinedButton.icon(
+                  onPressed: () => showSupplierPaymentDialog(context, store),
+                  icon: const Icon(Icons.payments),
+                  label: const Text('Pay Supplier')),
+              OutlinedButton.icon(
+                  onPressed: () => showPayrollDialog(context, store),
+                  icon: const Icon(Icons.badge),
+                  label: const Text('Payroll / HR')),
+              OutlinedButton.icon(
+                  onPressed: () => showCashUpDialog(context, store, statement),
+                  icon: const Icon(Icons.point_of_sale),
+                  label: const Text('Cash-Up')),
+              OutlinedButton.icon(
+                  onPressed: () =>
+                      showReconciliationDialog(context, store, statement),
+                  icon: const Icon(Icons.account_balance),
+                  label: const Text('Reconcile')),
+              OutlinedButton.icon(
+                  onPressed: () => showSupplierStatementDialog(context, store),
+                  icon: const Icon(Icons.description),
+                  label: const Text('Supplier Statement')),
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    await ReceiptOutputService.sharePdf(
+                        store.profitLossText(statement,
+                            allBranches: allBranches),
+                        filename: 'light-winter-profit-loss-$period.pdf',
+                        brandedReport: true);
+                  },
+                  icon: const Icon(Icons.picture_as_pdf),
+                  label: const Text('PDF / WhatsApp')),
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    await ReceiptOutputService.printNative(
+                        store.profitLossText(statement,
+                            allBranches: allBranches),
+                        brandedReport: true);
+                  },
+                  icon: const Icon(Icons.print),
+                  label: const Text('Print')),
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    await launchUrl(
+                        Uri.parse(
+                            'mailto:?subject=${Uri.encodeComponent('Light Winter Profit and Loss')}&body=${Uri.encodeComponent(store.profitLossText(statement, allBranches: allBranches))}'),
+                        mode: LaunchMode.externalApplication);
+                  },
+                  icon: const Icon(Icons.email),
+                  label: const Text('Email')),
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    final confirmed = await confirmTypedDelete(
+                        context,
+                        'Delete accounting entries?',
+                        allBranches
+                            ? 'Type DELETE ACCOUNTING to permanently delete all manual expenses and income entries for this shop.'
+                            : 'Type DELETE ACCOUNTING to permanently delete manual expenses and income entries for this branch.',
+                        'DELETE ACCOUNTING');
+                    if (!confirmed) return;
+                    await store.deleteAllAccountingEntries(
+                        allBranches: allBranches);
+                  },
+                  icon: const Icon(Icons.delete_sweep),
+                  label: const Text('Delete Entries')),
+            ]),
+          ]),
+        ),
+        const SizedBox(height: 16),
+        AccountingOverviewPanel(store: store, statement: statement),
+        const SizedBox(height: 16),
+        ProfitLossSummaryPanel(store: store, statement: statement),
+        const SizedBox(height: 16),
+        CashbookPanel(store: store, statement: statement),
+        const SizedBox(height: 16),
+        BalanceTrackerPanel(store: store, statement: statement),
+        const SizedBox(height: 16),
+        PayrollPanel(
+            store: store,
+            entries: store.payrollEntriesForPeriod(period,
+                allBranches: allBranches)),
+        const SizedBox(height: 16),
+        BusinessHealthPanel(store: store, statement: statement),
+        const SizedBox(height: 16),
+        AccountingCategoryPanel(store: store, statement: statement),
+        const SizedBox(height: 16),
+        AccountingEntryPanel(store: store, statement: statement),
+      ],
+    );
+  }
+}
+
+class AccountingOverviewPanel extends StatelessWidget {
+  const AccountingOverviewPanel(
+      {required this.store, required this.statement, super.key});
+  final AppStore store;
+  final ProfitLossStatement statement;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Accounting Overview',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Full shop accounting: sales, stock cost, supplier owing, customer debt, cashbook, owner money, and expenses.'),
+        const SizedBox(height: 12),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          AccountingChip(
+              icon: Icons.point_of_sale,
+              label: 'Sales income',
+              value: store.moneyFor(statement.report.totalSalesCents)),
+          AccountingChip(
+              icon: Icons.inventory_2,
+              label: 'Stock bought',
+              value: store.moneyFor(statement.stockPurchasesCents)),
+          AccountingChip(
+              icon: Icons.local_shipping,
+              label: 'Supplier owing',
+              value: store.moneyFor(statement.supplierPayablesCents)),
+          AccountingChip(
+              icon: Icons.account_balance_wallet,
+              label: 'Customer debt',
+              value: store.moneyFor(statement.customerDebtOutstandingCents)),
+          AccountingChip(
+              icon: Icons.savings,
+              label: 'Owner capital',
+              value: store.moneyFor(statement.ownerCapitalCents)),
+          AccountingChip(
+              icon: Icons.output,
+              label: 'Owner drawings',
+              value: store.moneyFor(statement.ownerDrawingsCents)),
+        ]),
+      ]),
+    );
+  }
+}
+
+class AccountingChip extends StatelessWidget {
+  const AccountingChip(
+      {required this.icon,
+      required this.label,
+      required this.value,
+      super.key});
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 190,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      child: Row(children: [
+        Icon(icon, color: Theme.of(context).colorScheme.primary),
+        const SizedBox(width: 8),
+        Expanded(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12)),
+            Text(value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w900)),
+          ]),
+        )
+      ]),
+    );
+  }
+}
+
+class ProfitLossSummaryPanel extends StatelessWidget {
+  const ProfitLossSummaryPanel(
+      {required this.store, required this.statement, super.key});
+  final AppStore store;
+  final ProfitLossStatement statement;
+
+  @override
+  Widget build(BuildContext context) {
+    final profitColor = statement.netProfitCents >= 0
+        ? const Color(0xFF168354)
+        : const Color(0xFFB3261E);
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Full Profit / Loss Statement',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 10),
+        TotalRow(
+            label: 'Net sales',
+            value: store.moneyFor(statement.report.totalSalesCents),
+            bold: true),
+        TotalRow(
+            label: 'Cost of goods sold',
+            value: store.moneyFor(statement.report.costOfGoodsCents)),
+        TotalRow(
+            label: 'Gross profit',
+            value: store.moneyFor(statement.report.grossProfitCents),
+            bold: true),
+        TotalRow(
+            label: 'Other income',
+            value: store.moneyFor(statement.otherIncomeCents)),
+        TotalRow(
+            label: 'Owner capital',
+            value: store.moneyFor(statement.ownerCapitalCents)),
+        TotalRow(
+            label: 'Operating expenses',
+            value: store.moneyFor(statement.operatingExpensesCents)),
+        TotalRow(
+            label: 'Owner drawings',
+            value: store.moneyFor(statement.ownerDrawingsCents)),
+        const Divider(height: 20),
+        Row(children: [
+          Expanded(
+            child: Text('Net profit / loss',
+                style:
+                    const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+          ),
+          Text(store.moneyFor(statement.netProfitCents),
+              style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w900,
+                  color: profitColor)),
+        ]),
+        const SizedBox(height: 6),
+        TotalRow(
+            label: 'Net margin',
+            value: '${statement.netMarginPercent.toStringAsFixed(1)}%',
+            bold: true),
+        const Divider(height: 20),
+        TotalRow(
+            label: 'Stock purchases',
+            value: store.moneyFor(statement.stockPurchasesCents)),
+        TotalRow(
+            label: 'Supplier payments',
+            value: store.moneyFor(statement.supplierPaymentsCents)),
+        TotalRow(
+            label: 'Supplier still owing',
+            value: store.moneyFor(statement.supplierPayablesCents),
+            bold: true),
+        TotalRow(
+            label: 'Customer debt outstanding',
+            value: store.moneyFor(statement.customerDebtOutstandingCents),
+            bold: true),
+        const Divider(height: 20),
+        TotalRow(
+            label: 'Stock value at cost',
+            value: store.moneyFor(statement.report.stockValueAtCostCents)),
+        TotalRow(
+            label: 'Stock value at selling price',
+            value: store.moneyFor(statement.report.stockValueAtRetailCents)),
+        TotalRow(
+            label: 'Potential stock profit',
+            value: store.moneyFor(statement.report.potentialStockProfitCents)),
+      ]),
+    );
+  }
+}
+
+class AccountingCategoryPanel extends StatelessWidget {
+  const AccountingCategoryPanel(
+      {required this.store, required this.statement, super.key});
+  final AppStore store;
+  final ProfitLossStatement statement;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(builder: (context, constraints) {
+      final wide = constraints.maxWidth >= 760;
+      final expenses = AccountingCategoryList(
+          title: 'Expenses by Category',
+          empty: 'No expenses recorded.',
+          values: statement.expensesByCategory,
+          store: store);
+      final income = AccountingCategoryList(
+          title: 'Other Income by Category',
+          empty: 'No other income recorded.',
+          values: statement.incomeByCategory,
+          store: store);
+      if (wide) {
+        return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(child: expenses),
+          const SizedBox(width: 12),
+          Expanded(child: income),
+        ]);
+      }
+      return Column(children: [expenses, const SizedBox(height: 12), income]);
+    });
+  }
+}
+
+class CashbookPanel extends StatelessWidget {
+  const CashbookPanel(
+      {required this.store, required this.statement, super.key});
+  final AppStore store;
+  final ProfitLossStatement statement;
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = statement.cashbookByMethod.entries.toList();
+    final cashIn = rows
+        .where((entry) => entry.key.endsWith('in'))
+        .fold(0, (sum, entry) => sum + entry.value);
+    final cashOut = rows
+        .where((entry) => entry.key.endsWith('out'))
+        .fold(0, (sum, entry) => sum + entry.value);
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Cashbook',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Tracks money entering and leaving cash, card, mobile money, and bank records.'),
+        const SizedBox(height: 10),
+        TotalRow(label: 'Money in', value: store.moneyFor(cashIn), bold: true),
+        TotalRow(
+            label: 'Money out', value: store.moneyFor(cashOut), bold: true),
+        TotalRow(
+            label: 'Net movement',
+            value: store.moneyFor(cashIn - cashOut),
+            bold: true),
+        const Divider(height: 18),
+        ...rows.map((entry) =>
+            TotalRow(label: entry.key, value: store.moneyFor(entry.value))),
+      ]),
+    );
+  }
+}
+
+class BalanceTrackerPanel extends StatelessWidget {
+  const BalanceTrackerPanel(
+      {required this.store, required this.statement, super.key});
+  final AppStore store;
+  final ProfitLossStatement statement;
+
+  @override
+  Widget build(BuildContext context) {
+    final suppliers = statement.supplierBalances.entries
+        .where((entry) => entry.value != 0)
+        .toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return LayoutBuilder(builder: (context, constraints) {
+      final wide = constraints.maxWidth >= 760;
+      final supplierPanel = DecoratedPanel(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Supplier Balances',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+          const SizedBox(height: 6),
+          const Text('Shows who the shop still owes after stock purchases.'),
+          const SizedBox(height: 10),
+          if (suppliers.isEmpty)
+            const Text('No supplier balances in this period.')
+          else
+            ...suppliers.map((entry) => TotalRow(
+                label: entry.key,
+                value: store.moneyFor(entry.value),
+                bold: entry.value > 0)),
+        ]),
+      );
+      final debtPanel = DecoratedPanel(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Customer Debt Aging',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+          const SizedBox(height: 6),
+          const Text('Shows how old unpaid customer balances are.'),
+          const SizedBox(height: 10),
+          ...statement.customerDebtAging.entries.map((entry) =>
+              TotalRow(label: entry.key, value: store.moneyFor(entry.value))),
+        ]),
+      );
+      if (wide) {
+        return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(child: supplierPanel),
+          const SizedBox(width: 12),
+          Expanded(child: debtPanel),
+        ]);
+      }
+      return Column(children: [
+        supplierPanel,
+        const SizedBox(height: 12),
+        debtPanel,
+      ]);
+    });
+  }
+}
+
+class PayrollPanel extends StatelessWidget {
+  const PayrollPanel({required this.store, required this.entries, super.key});
+  final AppStore store;
+  final List<AccountingEntry> entries;
+
+  @override
+  Widget build(BuildContext context) {
+    final total = entries.fold(0, (sum, entry) => sum + entry.amountCents);
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Employee Payroll / Light HR',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Record wages, salaries, advances, deductions, roles, and pay periods. Payroll is included in profit/loss.'),
+        const SizedBox(height: 10),
+        TotalRow(
+            label: 'Payroll in period',
+            value: store.moneyFor(total),
+            bold: true),
+        const SizedBox(height: 8),
+        if (entries.isEmpty)
+          const Text('No payroll records in this period.')
+        else
+          ...entries.take(12).map((entry) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.badge),
+                title: Text(entry.counterparty.isEmpty
+                    ? entry.description
+                    : entry.counterparty),
+                subtitle: Text(
+                    '${shortDate(entry.createdAt)} | ${entry.description} | ${entry.paymentMethod}'),
+                trailing: Text(store.moneyFor(entry.amountCents),
+                    style: const TextStyle(fontWeight: FontWeight.w900)),
+              )),
+      ]),
+    );
+  }
+}
+
+class BusinessHealthPanel extends StatelessWidget {
+  const BusinessHealthPanel(
+      {required this.store, required this.statement, super.key});
+  final AppStore store;
+  final ProfitLossStatement statement;
+
+  @override
+  Widget build(BuildContext context) {
+    final alerts = <String>[];
+    if (statement.netProfitCents < 0) {
+      alerts.add('Net loss detected for this period.');
+    }
+    if (statement.supplierPayablesCents > 0) {
+      alerts.add('Supplier balances need attention.');
+    }
+    if (statement.customerDebtOutstandingCents > 0) {
+      alerts.add('Customer debt is outstanding.');
+    }
+    if (store.lowStockCount > 0) {
+      alerts.add('${store.lowStockCount} products are low stock.');
+    }
+    if (store.outOfStockCount > 0) {
+      alerts.add('${store.outOfStockCount} products are out of stock.');
+    }
+    final lowMargin = store.products
+        .where((product) =>
+            product.priceCents > 0 &&
+            product.costCents > 0 &&
+            ((product.priceCents - product.costCents) / product.priceCents) <
+                0.15)
+        .take(5)
+        .map((product) => product.name)
+        .toList();
+    if (lowMargin.isNotEmpty) {
+      alerts.add('Low margin products: ${lowMargin.join(', ')}.');
+    }
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Business Health Alerts',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Quick owner warnings from stock, profit, debt, and margins.'),
+        const SizedBox(height: 10),
+        if (alerts.isEmpty)
+          const Text('No major alerts for this period.')
+        else
+          ...alerts.map((alert) => Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(Icons.warning_amber,
+                          size: 20,
+                          color: Theme.of(context).colorScheme.primary),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(alert)),
+                    ]),
+              )),
+      ]),
+    );
+  }
+}
+
+class AccountingCategoryList extends StatelessWidget {
+  const AccountingCategoryList(
+      {required this.title,
+      required this.empty,
+      required this.values,
+      required this.store,
+      super.key});
+  final String title;
+  final String empty;
+  final Map<String, int> values;
+  final AppStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = values.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(title,
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 8),
+        if (rows.isEmpty) Text(empty),
+        ...rows.map((entry) => TotalRow(
+            label: entry.key, value: store.moneyFor(entry.value), bold: true)),
+      ]),
+    );
+  }
+}
+
+class AccountingEntryPanel extends StatelessWidget {
+  const AccountingEntryPanel(
+      {required this.store, required this.statement, super.key});
+  final AppStore store;
+  final ProfitLossStatement statement;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Expense / Income Register',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Record rent, wages, transport, internet, packaging, repairs, bank charges, and other non-stock accounting entries here.'),
+        const SizedBox(height: 10),
+        if (statement.entries.isEmpty)
+          const Text('No accounting entries in this period.')
+        else
+          ...statement.entries.map((entry) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(entry.type == AccountingEntryType.income
+                    ? Icons.add_card
+                    : Icons.receipt_long),
+                title: Text(entry.description,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w800)),
+                subtitle: Text(
+                    '${shortDateTime(entry.createdAt)} | ${entry.typeLabel} | ${entry.category}${entry.counterparty.isEmpty ? '' : ' | ${entry.counterparty}'}'),
+                trailing: Wrap(
+                    spacing: 4,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text(store.moneyFor(entry.amountCents),
+                          style: const TextStyle(fontWeight: FontWeight.w900)),
+                      IconButton(
+                          tooltip: 'Delete entry',
+                          onPressed: () async {
+                            final confirmed = await confirmDanger(
+                                context,
+                                'Delete accounting entry?',
+                                'Remove ${entry.description}?');
+                            if (confirmed)
+                              await store.deleteAccountingEntry(entry);
+                          },
+                          icon: const Icon(Icons.delete)),
+                    ]),
+              )),
+      ]),
+    );
+  }
+}
+
+class SmartInsightsPanel extends StatelessWidget {
+  const SmartInsightsPanel(
+      {required this.store, required this.insights, super.key});
+  final AppStore store;
+  final List<SmartInsight> insights;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(Icons.auto_awesome,
+              color: Theme.of(context).colorScheme.primary),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text('Smart Business Insights',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        const Text(
+            'Careful suggestions from real shop data. Review before acting.'),
+        const SizedBox(height: 12),
+        if (insights.isEmpty)
+          const Text('No major insights for this period.')
+        else
+          LayoutBuilder(builder: (context, constraints) {
+            final wide = constraints.maxWidth >= 760;
+            final width =
+                wide ? (constraints.maxWidth - 12) / 2 : constraints.maxWidth;
+            return Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: insights
+                  .map((insight) => SizedBox(
+                      width: width, child: SmartInsightCard(insight: insight)))
+                  .toList(),
+            );
+          }),
+      ]),
+    );
+  }
+}
+
+class SmartInsightCard extends StatelessWidget {
+  const SmartInsightCard({required this.insight, super.key});
+  final SmartInsight insight;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = switch (insight.tone) {
+      Tone.good => const Color(0xFF168354),
+      Tone.warning => const Color(0xFF9A6700),
+      Tone.danger => const Color(0xFFB3261E),
+      _ => Theme.of(context).colorScheme.primary,
+    };
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.28)),
+      ),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Icon(insight.icon, color: color),
+        const SizedBox(width: 10),
+        Expanded(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(insight.title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w900)),
+            const SizedBox(height: 4),
+            Text(insight.body,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 13)),
+          ]),
+        ),
+      ]),
+    );
+  }
+}
+
 class MetricGrid extends StatelessWidget {
   const MetricGrid({required this.store, required this.report, super.key});
   final AppStore store;
   final ReportSnapshot report;
+
   @override
   Widget build(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
-    final columns = width >= 1180
-        ? 4
-        : width >= 720
-            ? 2
-            : 1;
-    return GridView.count(
-      crossAxisCount: columns,
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      crossAxisSpacing: 12,
-      mainAxisSpacing: 12,
-      childAspectRatio: columns == 1 ? 3.5 : 2.5,
-      children: [
+    final periodLabel = report.title.startsWith('Weekly')
+        ? 'Weekly'
+        : report.title.startsWith('Monthly')
+            ? 'Monthly'
+            : report.title.startsWith('Yearly')
+                ? 'Yearly'
+                : 'Daily';
+    final cardWidth = width >= 1180
+        ? (width - 72) / 4
+        : width >= 360
+            ? (width - 52) / 2
+            : width - 32;
+    final cards = [
+      MetricCard(
+          label: '$periodLabel sales',
+          value: store.moneyFor(report.totalSalesCents),
+          icon: Icons.payments),
+      MetricCard(
+          label: '$periodLabel transactions',
+          value: '${report.transactionCount}',
+          icon: Icons.receipt_long),
+      MetricCard(
+          label: '$periodLabel debt',
+          value: store.moneyFor(report.debtCents),
+          icon: Icons.account_balance_wallet),
+      MetricCard(
+          label: '$periodLabel gross profit',
+          value: store.moneyFor(report.grossProfitCents),
+          icon: Icons.trending_up),
+      MetricCard(
+          label: '$periodLabel margin',
+          value: '${report.grossMarginPercent.toStringAsFixed(1)}%',
+          icon: Icons.percent),
+      MetricCard(
+          label: '$periodLabel average sale',
+          value: store.moneyFor(report.averageSaleCents),
+          icon: Icons.inventory_2),
+      if (store.fiscalMode)
         MetricCard(
-            label: report.title,
-            value: store.moneyFor(report.totalSalesCents),
-            icon: Icons.payments),
-        MetricCard(
-            label: 'Transactions',
-            value: '${report.transactionCount}',
+            label: 'Fiscal day',
+            value:
+                store.fiscalDayOpen ? '#${store.fiscalDayNo} open' : 'Closed',
             icon: Icons.receipt_long),
-        MetricCard(
-            label: 'Debt in period',
-            value: store.moneyFor(report.debtCents),
-            icon: Icons.account_balance_wallet),
-        MetricCard(
-            label: 'Average sale',
-            value: store.moneyFor(report.averageSaleCents),
-            icon: Icons.inventory_2),
-        if (store.fiscalMode)
-          MetricCard(
-              label: 'Fiscal day',
-              value:
-                  store.fiscalDayOpen ? '#${store.fiscalDayNo} open' : 'Closed',
-              icon: Icons.receipt_long),
-      ],
+    ];
+    return Wrap(
+      spacing: 10,
+      runSpacing: 10,
+      children: cards
+          .map((card) => SizedBox(width: cardWidth, height: 86, child: card))
+          .toList(),
     );
   }
 }
@@ -6343,6 +10036,34 @@ class ReportBreakdown extends StatelessWidget {
             bold: true),
         TotalRow(
             label: 'Discounts', value: store.moneyFor(report.discountCents)),
+        const Divider(height: 20),
+        const Text('Profit / Loss',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        TotalRow(
+            label: 'Cost of goods sold',
+            value: store.moneyFor(report.costOfGoodsCents)),
+        TotalRow(
+            label: 'Gross profit',
+            value: store.moneyFor(report.grossProfitCents),
+            bold: true),
+        TotalRow(
+            label: 'Gross margin',
+            value: '${report.grossMarginPercent.toStringAsFixed(1)}%',
+            bold: true),
+        TotalRow(
+            label: 'Stock value at cost',
+            value: store.moneyFor(report.stockValueAtCostCents)),
+        TotalRow(
+            label: 'Stock value at selling price',
+            value: store.moneyFor(report.stockValueAtRetailCents)),
+        TotalRow(
+            label: 'Potential stock profit',
+            value: store.moneyFor(report.potentialStockProfitCents)),
+        const Divider(height: 20),
+        const Text('Payment Mix',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
         TotalRow(label: 'Cash', value: store.moneyFor(report.cashCents)),
         TotalRow(label: 'Card', value: store.moneyFor(report.cardCents)),
         TotalRow(
@@ -6377,7 +10098,7 @@ class ReportBreakdown extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         const Text(
-            'Profit & loss documents need buying-cost data before true profit can be calculated. This report is already synced for sales, stock movement, payment mix, discounts, and debt.',
+            'Profit is calculated from the buying cost saved on each product at the time of sale. Add buying cost in Stock for accurate P/L.',
             style: TextStyle(fontWeight: FontWeight.w700)),
       ]),
     );
@@ -6455,6 +10176,8 @@ class UserPerformancePanel extends StatelessWidget {
                 DataColumn(label: Text('Gross')),
                 DataColumn(label: Text('Voided')),
                 DataColumn(label: Text('Net')),
+                DataColumn(label: Text('Cost')),
+                DataColumn(label: Text('Profit')),
                 DataColumn(label: Text('Debt')),
               ],
               rows: report.userPerformance
@@ -6464,6 +10187,8 @@ class UserPerformancePanel extends StatelessWidget {
                         DataCell(Text(store.moneyFor(user.grossCents))),
                         DataCell(Text(store.moneyFor(user.voidedCents))),
                         DataCell(Text(store.moneyFor(user.netCents))),
+                        DataCell(Text(store.moneyFor(user.costCents))),
+                        DataCell(Text(store.moneyFor(user.profitCents))),
                         DataCell(Text(store.moneyFor(user.debtCents))),
                       ]))
                   .toList(),
@@ -6507,6 +10232,81 @@ class ProductPerformancePanel extends StatelessWidget {
   }
 }
 
+class TransactionDetailPanel extends StatelessWidget {
+  const TransactionDetailPanel(
+      {required this.store, required this.report, super.key});
+  final AppStore store;
+  final ReportSnapshot report;
+
+  @override
+  Widget build(BuildContext context) {
+    final transactions = report.sales.take(40).toList();
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Transaction Details',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Shows time, operator, payment method, items, quantities, sales value, cost, and profit for the selected period.'),
+        const SizedBox(height: 10),
+        if (transactions.isEmpty)
+          const Text('No transactions in this period.')
+        else
+          ...transactions.map((sale) {
+            final lineCost =
+                sale.lines.fold(0, (sum, line) => sum + line.lineCostCents);
+            final lineProfit = sale.totalCents - lineCost;
+            return Card(
+              elevation: 0,
+              margin: const EdgeInsets.only(bottom: 10),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  side: BorderSide(
+                      color: Theme.of(context).colorScheme.outlineVariant)),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Wrap(spacing: 10, runSpacing: 6, children: [
+                        Text(shortDateTime(sale.createdAt),
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w900)),
+                        Text('Branch: ${store.branchNameForId(sale.branchId)}'),
+                        Text('User: ${sale.cashier}'),
+                        Text('Payment: ${sale.paymentMethod}'),
+                        if (sale.customerName.isNotEmpty)
+                          Text('Customer: ${sale.customerName}'),
+                      ]),
+                      const SizedBox(height: 8),
+                      ...sale.lines.map((line) => Padding(
+                            padding: const EdgeInsets.only(bottom: 4),
+                            child: Text(
+                                '${store.saleLineDisplayName(line)} | Qty ${line.quantity} | Sales ${store.moneyFor(line.lineTotalCents)} | Cost ${store.moneyFor(line.lineCostCents)}'),
+                          )),
+                      const Divider(),
+                      Wrap(spacing: 14, runSpacing: 6, children: [
+                        Text('Net ${store.moneyFor(sale.totalCents)}',
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w900)),
+                        Text('Cost ${store.moneyFor(lineCost)}'),
+                        Text('Profit ${store.moneyFor(lineProfit)}',
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w900)),
+                      ]),
+                    ]),
+              ),
+            );
+          }),
+        if (report.sales.length > transactions.length)
+          Text(
+              'Showing latest ${transactions.length} transactions here. Export PDF for more details.',
+              style: const TextStyle(fontWeight: FontWeight.w700)),
+      ]),
+    );
+  }
+}
+
 class PerformanceList extends StatelessWidget {
   const PerformanceList(
       {required this.title,
@@ -6539,7 +10339,7 @@ class PerformanceList extends StatelessWidget {
                   style: const TextStyle(fontWeight: FontWeight.w800)),
               subtitle: Text(slowMode
                   ? 'No sales in selected period'
-                  : '${item.quantity} sold'),
+                  : '${item.quantity} sold${item.branchName.isEmpty ? '' : ' | ${item.branchName}'} | Profit ${store.moneyFor(item.profitCents)}'),
               trailing: Text(slowMode ? '-' : store.moneyFor(item.revenueCents),
                   style: const TextStyle(fontWeight: FontWeight.w900)),
             )),
@@ -6556,11 +10356,11 @@ class BackupPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     return DecoratedPanel(
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('Backup and Export',
+        const Text('Recovery and Safekeeping',
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
         const SizedBox(height: 8),
         const Text(
-            'Back up reports, stock, suppliers, customers, branches, users, sales cache, transfer history, and fiscal/company settings. Cloud sync remains the live shared database.'),
+            'Save a recovery file and owner recovery summary for support. Business reports are exported from Report Controls or the Profit section. Cloud sync remains the live shared database.'),
         const SizedBox(height: 8),
         SelectableText(
           'Owner recovery code: ${store.recoveryCode.isEmpty ? 'Sync once to generate' : store.recoveryCode}',
@@ -6572,26 +10372,27 @@ class BackupPanel extends StatelessWidget {
               onPressed: () async {
                 final file = await store.createJsonBackupFile();
                 if (context.mounted)
-                  showMessage(context, 'Backup saved: ${file.path}');
+                  showMessage(context, 'Recovery file saved: ${file.path}');
               },
               icon: const Icon(Icons.save),
-              label: const Text('Save JSON Backup')),
+              label: const Text('Save Recovery File')),
           OutlinedButton.icon(
               onPressed: () async {
                 await ReceiptOutputService.sharePdf(store.backupText(),
-                    filename: 'light-winter-backup-manifest.pdf');
+                    filename: 'light-winter-recovery-summary.pdf',
+                    brandedReport: true);
               },
               icon: const Icon(Icons.picture_as_pdf),
-              label: const Text('Backup PDF')),
+              label: const Text('Recovery Summary PDF')),
           OutlinedButton.icon(
               onPressed: () async {
                 await launchUrl(
                     Uri.parse(
-                        'mailto:?subject=${Uri.encodeComponent('Light Winter Backup Manifest')}&body=${Uri.encodeComponent(store.backupText())}'),
+                        'mailto:?subject=${Uri.encodeComponent('Light Winter Recovery Summary')}&body=${Uri.encodeComponent(store.backupText())}'),
                     mode: LaunchMode.externalApplication);
               },
               icon: const Icon(Icons.email),
-              label: const Text('Email Backup')),
+              label: const Text('Email Recovery Summary')),
         ]),
       ]),
     );
@@ -6611,7 +10412,10 @@ class _PosPageState extends State<PosPage> {
   @override
   Widget build(BuildContext context) {
     final store = widget.store;
-    final products = store.products.where((product) {
+    final searchScope = store.allowCatalogueWideSale
+        ? store.activeCatalogueProducts
+        : store.currentBranchAssignedProducts;
+    final products = searchScope.where((product) {
       final q = query.toLowerCase();
       final available =
           product.isCustom ? 999999 : store.sellableQuantityFor(product);
@@ -6620,7 +10424,8 @@ class _PosPageState extends State<PosPage> {
           product.barcode.contains(q);
       return matchesQuery && available > 0;
     }).toList();
-    final visibleProducts = products.take(2).toList();
+    final hasSearch = query.trim().isNotEmpty;
+    final visibleProducts = hasSearch ? products : products.take(2).toList();
     final wide = MediaQuery.sizeOf(context).width >= 980;
     final productPanel = DecoratedPanel(
       child: Column(
@@ -6638,7 +10443,9 @@ class _PosPageState extends State<PosPage> {
           ),
           const SizedBox(height: 12),
           Text(
-              'Showing ${visibleProducts.length} of ${products.length} matching products',
+              hasSearch
+                  ? 'Showing all ${visibleProducts.length} matching products'
+                  : 'Showing ${visibleProducts.length} of ${products.length} matching products',
               style: Theme.of(context).textTheme.labelMedium),
           const SizedBox(height: 8),
           Wrap(
@@ -6651,7 +10458,8 @@ class _PosPageState extends State<PosPage> {
                     stockLabel: store.allowCatalogueWideSale
                         ? 'catalogue stock'
                         : 'branch stock',
-                    moneyText: store.moneyFor(product.priceCents),
+                    moneyText: store.moneyFor(product.priceCents,
+                        currency: store.posCurrency),
                     onTap: () => store.addToCart(product)))
                 .toList(),
           ),
@@ -6718,13 +10526,21 @@ class _PosPageState extends State<PosPage> {
                       onPressed: () => store.decrementCartItem(item),
                       icon: const Icon(Icons.remove_circle_outline),
                       tooltip: 'Subtract one'),
-                  Text('${item.quantity}',
-                      style: const TextStyle(fontWeight: FontWeight.w900)),
+                  InkWell(
+                    onTap: () => showCartQuantityDialog(context, store, item),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      child: Text('${item.quantity}',
+                          style: const TextStyle(fontWeight: FontWeight.w900)),
+                    ),
+                  ),
                   IconButton(
                       onPressed: () => store.incrementCartItem(item),
                       icon: const Icon(Icons.add_circle_outline),
                       tooltip: 'Add one'),
-                  Text(store.moneyFor(item.product.priceCents * item.quantity),
+                  Text(
+                      store.moneyFor(item.product.priceCents * item.quantity,
+                          currency: store.posCurrency),
                       style: const TextStyle(fontWeight: FontWeight.w900)),
                   IconButton(
                       onPressed: () => store.removeFromCart(item),
@@ -6735,15 +10551,16 @@ class _PosPageState extends State<PosPage> {
           const Divider(),
           TotalRow(
               label: 'Total',
-              value: store.moneyFor(store.cartTotalCents),
+              value: store.moneyFor(store.cartTotalCents,
+                  currency: store.posCurrency),
               bold: true),
           Wrap(
             spacing: 8,
             children: ['USD', 'ZWL', 'ZAR', 'BWP']
                 .map((code) => ChoiceChip(
                       label: Text(code),
-                      selected: store.displayCurrency == code,
-                      onSelected: (_) => store.setDisplayCurrency(code),
+                      selected: store.posCurrency == code,
+                      onSelected: (_) => store.setPosCurrency(code),
                     ))
                 .toList(),
           ),
@@ -6849,107 +10666,114 @@ class _InventoryPageState extends State<InventoryPage> {
       ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     final compact = MediaQuery.sizeOf(context).width < 620;
 
+    final summaryCards = [
+      ShortcutTile(
+          key: ValueKey('products-$selectedProducts-$branchUnits-$allUnits'),
+          icon: Icons.inventory_2,
+          title: 'Shown products',
+          value: '$selectedProducts',
+          selected: !showingSuppliers && status == 'all',
+          onTap: () => setState(() {
+                showingSuppliers = false;
+                status = 'all';
+                query = '';
+              })),
+      ShortcutTile(
+          key: ValueKey('selected-units-$selectedUnits-$branchUnits-$allUnits'),
+          icon: Icons.warehouse,
+          title: 'Shown pieces',
+          value: '$selectedUnits',
+          selected: false,
+          onTap: () => showMessage(context,
+              'Total individual stock quantity in the selected stock view.')),
+      ShortcutTile(
+          key: ValueKey('branch-units-$branchUnits'),
+          icon: Icons.storefront,
+          title: 'Branch pieces',
+          value: '$branchUnits',
+          selected: false,
+          onTap: () => showMessage(context,
+              'Pieces currently assigned to ${store.currentBranch?.name ?? 'this branch'}.')),
+      ShortcutTile(
+          key: ValueKey('all-units-$allUnits'),
+          icon: Icons.account_tree,
+          title: 'All pieces',
+          value: '$allUnits',
+          selected: false,
+          onTap: () => showMessage(context,
+              'Pieces across every branch in this shop. Transfers between branches do not change this total.')),
+      ShortcutTile(
+          key: ValueKey('categories-$selectedCategories-$selectedProducts'),
+          icon: Icons.category,
+          title: 'Categories',
+          value: '$selectedCategories',
+          selected: false,
+          onTap: () => showCategorySummaryDialog(context, store)),
+      ShortcutTile(
+          key: ValueKey('low-$selectedLow-$selectedUnits'),
+          icon: Icons.warning,
+          title: 'Low stock',
+          value: '$selectedLow',
+          selected: !showingSuppliers && status == 'low',
+          onTap: () => setState(() {
+                showingSuppliers = false;
+                status = 'low';
+              })),
+      ShortcutTile(
+          key: ValueKey('out-$selectedOut-$selectedUnits'),
+          icon: Icons.remove_shopping_cart,
+          title: 'Out of stock',
+          value: '$selectedOut',
+          selected: !showingSuppliers && status == 'out',
+          onTap: () => setState(() {
+                showingSuppliers = false;
+                status = 'out';
+              })),
+      ShortcutTile(
+          key: ValueKey('suppliers-$selectedSuppliers-$selectedProducts'),
+          icon: Icons.local_shipping,
+          title: 'Suppliers',
+          value: '$selectedSuppliers',
+          selected: showingSuppliers,
+          onTap: () => setState(() => showingSuppliers = true)),
+    ];
+
     return PageFrame(
       title: 'Stock Control',
       children: [
-        Wrap(spacing: 8, runSpacing: 8, children: [
-          OutlinedButton.icon(
-              onPressed: () => showSupplierDialog(context, store),
-              icon: const Icon(Icons.local_shipping),
-              label: const Text('Supplier')),
-          OutlinedButton.icon(
-              onPressed: () => importProductCsv(context, store),
-              icon: const Icon(Icons.upload_file),
-              label: Text(compact ? 'Import' : 'Import CSV')),
-          OutlinedButton.icon(
-              onPressed: () => showStockExportDialog(context, store),
-              icon: const Icon(Icons.ios_share),
-              label: const Text('Export Stock')),
-          FilledButton.icon(
-              onPressed: () => showProductDialog(context, store),
-              icon: const Icon(Icons.add),
-              label: const Text('Product')),
-          OutlinedButton.icon(
-              onPressed: () => showStockBulkDeleteDialog(context, store),
-              icon: const Icon(Icons.delete_sweep),
-              label: const Text('Delete')),
-        ]),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(children: [
+            OutlinedButton.icon(
+                onPressed: () => showSupplierDialog(context, store),
+                icon: const Icon(Icons.local_shipping),
+                label: const Text('Supplier')),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+                onPressed: () => importProductCsv(context, store),
+                icon: const Icon(Icons.upload_file),
+                label: Text(compact ? 'Import' : 'Import CSV')),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+                onPressed: () => showStockExportDialog(context, store),
+                icon: const Icon(Icons.ios_share),
+                label: const Text('Export')),
+            const SizedBox(width: 8),
+            FilledButton.icon(
+                onPressed: () => showProductDialog(context, store),
+                icon: const Icon(Icons.add),
+                label: const Text('Product')),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+                onPressed: () => showStockBulkDeleteDialog(context, store),
+                icon: const Icon(Icons.delete_sweep),
+                label: const Text('Delete')),
+          ]),
+        ),
+        const SizedBox(height: 10),
+        Wrap(spacing: 12, runSpacing: 12, children: summaryCards),
         const SizedBox(height: 12),
-        Wrap(spacing: 12, runSpacing: 12, children: [
-          ShortcutTile(
-              key:
-                  ValueKey('products-$selectedProducts-$branchUnits-$allUnits'),
-              icon: Icons.inventory_2,
-              title: 'Products',
-              value: '$selectedProducts',
-              selected: !showingSuppliers && status == 'all',
-              onTap: () => setState(() {
-                    showingSuppliers = false;
-                    status = 'all';
-                    query = '';
-                  })),
-          ShortcutTile(
-              key: ValueKey(
-                  'selected-units-$selectedUnits-$branchUnits-$allUnits'),
-              icon: Icons.warehouse,
-              title: store.catalogueWideViewEnabled
-                  ? 'All branches pieces'
-                  : 'This branch pieces',
-              value: '$selectedUnits',
-              selected: false,
-              onTap: () => showMessage(context,
-                  'Total individual stock quantity in the selected stock view.')),
-          ShortcutTile(
-              key: ValueKey('branch-units-$branchUnits'),
-              icon: Icons.storefront,
-              title: 'This branch',
-              value: '$branchUnits',
-              selected: false,
-              onTap: () => showMessage(context,
-                  'Pieces currently assigned to ${store.currentBranch?.name ?? 'this branch'}.')),
-          ShortcutTile(
-              key: ValueKey('all-units-$allUnits'),
-              icon: Icons.account_tree,
-              title: 'All branches',
-              value: '$allUnits',
-              selected: false,
-              onTap: () => showMessage(context,
-                  'Pieces across every branch in this shop. Transfers between branches do not change this total.')),
-          ShortcutTile(
-              key: ValueKey('categories-$selectedCategories-$selectedProducts'),
-              icon: Icons.category,
-              title: 'Categories',
-              value: '$selectedCategories',
-              selected: false,
-              onTap: () => showCategorySummaryDialog(context, store)),
-          ShortcutTile(
-              key: ValueKey('low-$selectedLow-$selectedUnits'),
-              icon: Icons.warning,
-              title: 'Low stock',
-              value: '$selectedLow',
-              selected: !showingSuppliers && status == 'low',
-              onTap: () => setState(() {
-                    showingSuppliers = false;
-                    status = 'low';
-                  })),
-          ShortcutTile(
-              key: ValueKey('out-$selectedOut-$selectedUnits'),
-              icon: Icons.remove_shopping_cart,
-              title: 'Out of stock',
-              value: '$selectedOut',
-              selected: !showingSuppliers && status == 'out',
-              onTap: () => setState(() {
-                    showingSuppliers = false;
-                    status = 'out';
-                  })),
-          ShortcutTile(
-              key: ValueKey('suppliers-$selectedSuppliers-$selectedProducts'),
-              icon: Icons.local_shipping,
-              title: 'Suppliers',
-              value: '$selectedSuppliers',
-              selected: showingSuppliers,
-              onTap: () => setState(() => showingSuppliers = true)),
-        ]),
+        BatchExpiryPanel(store: store),
         const SizedBox(height: 12),
         if (!showingSuppliers) ...[
           BranchCatalogueToggle(
@@ -7014,6 +10838,62 @@ class _InventoryPageState extends State<InventoryPage> {
         ] else
           SupplierPanel(store: store, suppliers: suppliersScope),
       ],
+    );
+  }
+}
+
+class BatchExpiryPanel extends StatelessWidget {
+  const BatchExpiryPanel({required this.store, super.key});
+  final AppStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final records = store.nearExpiryRecords();
+    final allRecords = store.batchExpiryRecords;
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Batch and Expiry Tracking',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'For food and pharmacy stock: enter batch and expiry when receiving stock. Average-cost valuation updates automatically.'),
+        const SizedBox(height: 10),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          AccountingChip(
+              icon: Icons.inventory_2,
+              label: 'Average-cost stock',
+              value: store.moneyFor(store.stockValueAtAverageCostCents)),
+          AccountingChip(
+              icon: Icons.layers,
+              label: 'FIFO layer value',
+              value: store.moneyFor(store.stockValueAtFifoCostCents)),
+          AccountingChip(
+              icon: Icons.event_busy,
+              label: 'Near / expired batches',
+              value: '${records.length}'),
+          AccountingChip(
+              icon: Icons.layers,
+              label: 'FIFO batch logs',
+              value: '${allRecords.length}'),
+        ]),
+        const SizedBox(height: 10),
+        if (allRecords.isEmpty)
+          const Text('No batch or expiry records yet.')
+        else if (records.isEmpty)
+          const Text('No batches expiring in the next 45 days.')
+        else
+          ...records.take(8).map((record) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(
+                    record.expired ? Icons.dangerous : Icons.warning_amber),
+                title: Text(record.productName,
+                    style: const TextStyle(fontWeight: FontWeight.w800)),
+                subtitle: Text(
+                    'Batch ${record.batchNumber.isEmpty ? '-' : record.batchNumber} | Qty ${record.quantity} | Expiry ${shortDate(record.expiryDate)}'),
+                trailing: Text(
+                    record.expired ? 'Expired' : '${record.daysLeft}d left'),
+              )),
+      ]),
     );
   }
 }
@@ -7278,7 +11158,12 @@ class ProductStockCard extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           Wrap(spacing: 16, runSpacing: 8, children: [
+            Text('Cost: ${store.moneyFor(product.costCents)}',
+                style: const TextStyle(fontWeight: FontWeight.w800)),
             Text('Price: ${store.moneyFor(product.priceCents)}',
+                style: const TextStyle(fontWeight: FontWeight.w800)),
+            Text(
+                'Unit profit: ${store.moneyFor(product.priceCents - product.costCents)}',
                 style: const TextStyle(fontWeight: FontWeight.w800)),
             Text(
                 showingCatalogueStock
@@ -7413,12 +11298,46 @@ class CustomerDebtPage extends StatefulWidget {
 }
 
 class _CustomerDebtPageState extends State<CustomerDebtPage> {
+  String customerSearch = '';
+  DateTime? customerDateFilter;
+  String debtSearch = '';
+  DateTime? debtDateFilter;
+  String debtStatusFilter = 'All';
   String voidSearch = '';
   DateTime? voidDateFilter;
 
   @override
   Widget build(BuildContext context) {
     final store = widget.store;
+    final filteredCustomers = store.customers.where((customer) {
+      final history = store.salesForCustomer(customer);
+      if (customerDateFilter != null &&
+          !history.any(
+              (sale) => sameLocalDay(sale.createdAt, customerDateFilter!))) {
+        return false;
+      }
+      final q = customerSearch.trim().toLowerCase();
+      if (q.isEmpty) return true;
+      return customer.code.toLowerCase().contains(q) ||
+          customer.name.toLowerCase().contains(q) ||
+          customer.phone.toLowerCase().contains(q);
+    }).toList();
+    final filteredDebts = widget.store.allKnownDebtSales.where((sale) {
+      if (debtDateFilter != null &&
+          !sameLocalDay(sale.createdAt, debtDateFilter!)) {
+        return false;
+      }
+      final status = widget.store.debtStatusForSale(sale);
+      if (debtStatusFilter != 'All' && status != debtStatusFilter) {
+        return false;
+      }
+      final q = debtSearch.trim().toLowerCase();
+      if (q.isEmpty) return true;
+      return sale.id.toLowerCase().contains(q) ||
+          sale.customerName.toLowerCase().contains(q) ||
+          sale.cashier.toLowerCase().contains(q) ||
+          widget.store.branchNameForId(sale.branchId).toLowerCase().contains(q);
+    }).toList();
     return PageFrame(
       title: 'Customers and Debt',
       trailing: FilledButton.icon(
@@ -7426,24 +11345,153 @@ class _CustomerDebtPageState extends State<CustomerDebtPage> {
           icon: const Icon(Icons.person_add),
           label: const Text('Customer')),
       children: [
-        DataStrip(headers: const [
-          'Customer',
-          'Phone'
-        ], rows: widget.store.customers.map((c) => [c.name, c.phone]).toList()),
+        DecoratedPanel(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Customer Codes',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 6),
+            const Text(
+                'Each customer gets a short code. Search by code, name, phone, or sale date.'),
+            const SizedBox(height: 10),
+            TextField(
+              decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search),
+                  labelText: 'Search customer code, name, or phone',
+                  border: OutlineInputBorder()),
+              onChanged: (value) => setState(() => customerSearch = value),
+            ),
+            const SizedBox(height: 8),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    final picked = await showDatePicker(
+                        context: context,
+                        initialDate: customerDateFilter ?? DateTime.now(),
+                        firstDate: DateTime(2020),
+                        lastDate: DateTime.now().add(const Duration(days: 1)));
+                    setState(() => customerDateFilter = picked);
+                  },
+                  icon: const Icon(Icons.calendar_month),
+                  label: Text(customerDateFilter == null
+                      ? 'Search by Date'
+                      : shortDate(customerDateFilter!))),
+              if (customerDateFilter != null)
+                TextButton.icon(
+                    onPressed: () => setState(() => customerDateFilter = null),
+                    icon: const Icon(Icons.close),
+                    label: const Text('Clear Date')),
+            ]),
+          ]),
+        ),
         const SizedBox(height: 12),
         DataStrip(
-            headers: const ['Sale', 'Payment', 'Cashier', 'Amount'],
-            rows: widget.store.sales
-                .map((sale) => [
-                      sale.customerName.isEmpty ? sale.id : sale.customerName,
-                      sale.paymentMethod,
-                      sale.cashier,
-                      widget.store.moneyFor(max(
-                          0,
-                          sale.totalCents -
-                              widget.store.voidedCentsForSale(sale.id)))
-                    ])
-                .toList()),
+            headers: const ['Code', 'Customer', 'Phone', 'Last Sale'],
+            rows: filteredCustomers.map((c) {
+              final history = store.salesForCustomer(c);
+              return [
+                c.code,
+                c.name,
+                c.phone,
+                history.isEmpty ? '-' : shortDate(history.first.createdAt)
+              ];
+            }).toList()),
+        const SizedBox(height: 12),
+        DebtLedgerPanel(
+          store: widget.store,
+          debts: filteredDebts,
+          query: debtSearch,
+          selectedDate: debtDateFilter,
+          statusFilter: debtStatusFilter,
+          onQueryChanged: (value) => setState(() => debtSearch = value),
+          onDateChanged: (value) => setState(() => debtDateFilter = value),
+          onStatusChanged: (value) => setState(() => debtStatusFilter = value),
+        ),
+        const SizedBox(height: 12),
+        DecoratedPanel(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Customer Statements',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 6),
+            const Text(
+                'Send a customer debt statement showing sale date, paid amount, remaining balance, and payment status.'),
+            const SizedBox(height: 10),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              OutlinedButton.icon(
+                  onPressed: widget.store.allKnownDebtSales.isEmpty
+                      ? null
+                      : () =>
+                          showCustomerStatementDialog(context, widget.store),
+                  icon: const Icon(Icons.description),
+                  label: const Text('Debt Statement PDF')),
+              OutlinedButton.icon(
+                  onPressed: filteredDebts.isEmpty
+                      ? null
+                      : () => ReceiptOutputService.sharePdf(
+                          widget.store.debtLedgerText(filteredDebts),
+                          filename: 'light-winter-debt-ledger.pdf',
+                          brandedReport: true),
+                  icon: const Icon(Icons.picture_as_pdf),
+                  label: const Text('Ledger PDF / WhatsApp')),
+              OutlinedButton.icon(
+                  onPressed: widget.store.customers.isEmpty
+                      ? null
+                      : () => showCustomerHistoryDialog(context, widget.store),
+                  icon: const Icon(Icons.history),
+                  label: const Text('Purchase History PDF')),
+            ]),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        DecoratedPanel(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              OutlinedButton.icon(
+                  onPressed: widget.store.sales.isEmpty
+                      ? null
+                      : () => showOldReceiptDialog(context, widget.store),
+                  icon: const Icon(Icons.receipt),
+                  label: const Text('Old Receipt')),
+            ]),
+            const SizedBox(height: 10),
+            const Text('Customer Cleanup',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 6),
+            const Text(
+                'Use only when the owner wants to clear old customer/debt records to save space.'),
+            const SizedBox(height: 10),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    final confirmed = await confirmTypedDelete(
+                        context,
+                        'Delete all customers?',
+                        'Type DELETE CUSTOMERS to permanently delete all saved customer names and phone numbers.',
+                        'DELETE CUSTOMERS');
+                    if (!confirmed) return;
+                    await widget.store.deleteAllCustomers();
+                  },
+                  icon: const Icon(Icons.person_remove),
+                  label: const Text('Delete Customers')),
+              OutlinedButton.icon(
+                  onPressed: () async {
+                    final confirmed = await confirmTypedDelete(
+                        context,
+                        'Delete all debt history?',
+                        'Type DELETE DEBTS to permanently delete debt sales and the report records linked to them.',
+                        'DELETE DEBTS');
+                    if (!confirmed) return;
+                    await widget.store.deleteAllDebtHistory();
+                  },
+                  icon: const Icon(Icons.delete_sweep),
+                  label: const Text('Delete Debt History')),
+            ]),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        SalesHistoryPanel(store: widget.store),
         const SizedBox(height: 12),
         VoidReturnsPanel(
           store: widget.store,
@@ -7454,21 +11502,353 @@ class _CustomerDebtPageState extends State<CustomerDebtPage> {
         ),
         const SizedBox(height: 12),
         if (widget.store.saleVoids.isNotEmpty)
-          DataStrip(
-              headers: const ['When', 'Type', 'User', 'Reason', 'Amount'],
-              rows: widget.store.saleVoids
-                  .take(20)
-                  .map((voidRecord) => [
-                        shortDateTime(voidRecord.createdAt),
-                        voidRecord.type.replaceAll('_', ' '),
-                        voidRecord.userName,
-                        voidRecord.reason,
-                        widget.store.moneyFor(voidRecord.totalCents),
-                      ])
-                  .toList()),
+          VoidHistoryPanel(store: widget.store),
       ],
     );
   }
+}
+
+class DebtLedgerPanel extends StatelessWidget {
+  const DebtLedgerPanel({
+    required this.store,
+    required this.debts,
+    required this.query,
+    required this.selectedDate,
+    required this.statusFilter,
+    required this.onQueryChanged,
+    required this.onDateChanged,
+    required this.onStatusChanged,
+    super.key,
+  });
+  final AppStore store;
+  final List<SaleRecord> debts;
+  final String query;
+  final DateTime? selectedDate;
+  final String statusFilter;
+  final ValueChanged<String> onQueryChanged;
+  final ValueChanged<DateTime?> onDateChanged;
+  final ValueChanged<String> onStatusChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Debt Ledger',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Shows when debt was created, what was paid, what remains, and whether it is unpaid, partially paid, or fully paid.'),
+        const SizedBox(height: 10),
+        TextField(
+          decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.search),
+              labelText: 'Search debt customer, sale, cashier, or branch',
+              border: OutlineInputBorder()),
+          onChanged: onQueryChanged,
+        ),
+        const SizedBox(height: 8),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          OutlinedButton.icon(
+              onPressed: () async {
+                final picked = await showDatePicker(
+                    context: context,
+                    initialDate: selectedDate ?? DateTime.now(),
+                    firstDate: DateTime(2020),
+                    lastDate: DateTime.now().add(const Duration(days: 1)));
+                onDateChanged(picked);
+              },
+              icon: const Icon(Icons.calendar_month),
+              label: Text(selectedDate == null
+                  ? 'Debt Date'
+                  : shortDate(selectedDate!))),
+          if (selectedDate != null)
+            TextButton.icon(
+                onPressed: () => onDateChanged(null),
+                icon: const Icon(Icons.close),
+                label: const Text('Clear Date')),
+          DropdownButton<String>(
+            value: statusFilter,
+            items: const ['All', 'Unpaid', 'Partially paid', 'Fully paid']
+                .map((item) => DropdownMenuItem(value: item, child: Text(item)))
+                .toList(),
+            onChanged: (value) => onStatusChanged(value ?? 'All'),
+          ),
+        ]),
+        const SizedBox(height: 12),
+        if (debts.isEmpty)
+          const Text('No debt sales match this filter.')
+        else
+          ...debts.map((sale) {
+            final balance = store.debtBalanceForSale(sale);
+            final status = store.debtStatusForSale(sale);
+            return Card(
+              elevation: 0,
+              margin: const EdgeInsets.only(bottom: 10),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  side: BorderSide(
+                      color: Theme.of(context).colorScheme.outlineVariant)),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Wrap(spacing: 10, runSpacing: 6, children: [
+                        Text(shortDateTime(sale.createdAt),
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w900)),
+                        Text(sale.customerName.isEmpty
+                            ? 'Customer: -'
+                            : 'Customer: ${sale.customerName}'),
+                        Text('Cashier: ${sale.cashier}'),
+                        Text('Status: $status',
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w900)),
+                      ]),
+                      const Divider(height: 18),
+                      Wrap(spacing: 14, runSpacing: 6, children: [
+                        Text('Sale ${store.moneyFor(sale.totalCents)}'),
+                        Text('Paid ${store.moneyFor(sale.paidCents)}'),
+                        Text('Balance ${store.moneyFor(balance)}',
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w900)),
+                      ]),
+                      const SizedBox(height: 8),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: OutlinedButton.icon(
+                          onPressed: balance <= 0
+                              ? null
+                              : () =>
+                                  showDebtPaymentDialog(context, store, sale),
+                          icon: const Icon(Icons.payments),
+                          label: Text(
+                              balance <= 0 ? 'Fully Paid' : 'Record Payment'),
+                        ),
+                      )
+                    ]),
+              ),
+            );
+          }),
+        if (store.customers.isNotEmpty) ...[
+          const Divider(height: 22),
+          const Text('Customer Purchase History',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+          const SizedBox(height: 8),
+          ...store.customers.take(8).map((customer) {
+            final history = store.salesForCustomer(customer);
+            if (history.isEmpty) return const SizedBox.shrink();
+            return ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.history),
+              title: Text('${customer.code} - ${customer.name}',
+                  style: const TextStyle(fontWeight: FontWeight.w800)),
+              subtitle: Text(
+                  '${history.length} sales | Last ${shortDateTime(history.first.createdAt)} | ${store.moneyFor(history.fold(0, (sum, sale) => sum + sale.totalCents))}'),
+            );
+          }),
+        ],
+      ]),
+    );
+  }
+}
+
+class SalesHistoryPanel extends StatelessWidget {
+  const SalesHistoryPanel({required this.store, super.key});
+  final AppStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final sales = store.allKnownSales.take(80).toList();
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Sales History',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Latest sales used by reports, debt, receipts, and customer history.'),
+        const SizedBox(height: 10),
+        if (sales.isEmpty)
+          const Text('No sales recorded yet.')
+        else
+          ...sales.map((sale) {
+            final net =
+                max(0, sale.totalCents - store.voidedCentsForSale(sale.id));
+            return Card(
+              elevation: 0,
+              margin: const EdgeInsets.only(bottom: 8),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  side: BorderSide(
+                      color: Theme.of(context).colorScheme.outlineVariant)),
+              child: ListTile(
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                leading: const Icon(Icons.receipt_long),
+                title: Text(
+                    '${sale.customerName.isEmpty ? sale.id : sale.customerName} - ${store.moneyFor(net)}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w900)),
+                subtitle: Text(
+                    '${shortDateTime(sale.createdAt)} | ${store.branchNameForId(sale.branchId)} | ${sale.paymentMethod} | ${sale.cashier}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis),
+                trailing: IconButton(
+                  tooltip: 'Delete sale',
+                  icon: const Icon(Icons.delete),
+                  onPressed: () async {
+                    final ok = await confirmAction(context, 'Delete this sale?',
+                        'This removes the sale from reports, debt, receipts, and cloud sync. Stock is not adjusted again.');
+                    if (!ok) return;
+                    await store.deleteSaleRecord(sale);
+                  },
+                ),
+              ),
+            );
+          }),
+      ]),
+    );
+  }
+}
+
+class VoidHistoryPanel extends StatelessWidget {
+  const VoidHistoryPanel({required this.store, super.key});
+  final AppStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final voids = store.saleVoids.take(80).toList();
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Expanded(
+            child: Text('Void / Return History',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+          ),
+          TextButton.icon(
+              onPressed: voids.isEmpty
+                  ? null
+                  : () async {
+                      final ok = await confirmTypedDelete(
+                          context,
+                          'Delete all void history?',
+                          'Type DELETE VOIDS to remove all void/return records from this device and cloud. Reports will no longer subtract those voids.',
+                          'DELETE VOIDS');
+                      if (!ok) return;
+                      await store.deleteAllVoidHistory();
+                    },
+              icon: const Icon(Icons.delete_sweep),
+              label: const Text('Delete All')),
+        ]),
+        const SizedBox(height: 6),
+        const Text(
+            'These records explain returns and voids. Delete only if the owner intentionally wants to remove that correction history.'),
+        const SizedBox(height: 10),
+        if (voids.isEmpty)
+          const Text('No voids or returns recorded yet.')
+        else
+          ...voids.map((record) => Card(
+                elevation: 0,
+                margin: const EdgeInsets.only(bottom: 8),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: BorderSide(
+                        color: Theme.of(context).colorScheme.outlineVariant)),
+                child: ListTile(
+                  contentPadding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  leading: const Icon(Icons.undo),
+                  title: Text(
+                      '${record.type.replaceAll('_', ' ')} - ${store.moneyFor(record.totalCents)}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w900)),
+                  subtitle: Text(
+                      '${shortDateTime(record.createdAt)} | ${store.branchNameForId(record.branchId)} | ${record.userName} | ${record.reason}',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis),
+                  trailing: IconButton(
+                    tooltip: 'Delete void record',
+                    icon: const Icon(Icons.delete),
+                    onPressed: () async {
+                      final ok = await confirmAction(
+                          context,
+                          'Delete this void record?',
+                          'This removes the void/return record from reports and cloud sync. Stock is not adjusted again.');
+                      if (!ok) return;
+                      await store.deleteVoidRecord(record);
+                    },
+                  ),
+                ),
+              )),
+      ]),
+    );
+  }
+}
+
+Future<void> showDebtPaymentDialog(
+    BuildContext context, AppStore store, SaleRecord sale) async {
+  final amount = TextEditingController();
+  final balance = store.debtBalanceForSale(sale);
+  if (balance <= 0) {
+    showMessage(context, 'This debt is already fully paid.');
+    return;
+  }
+  await showDialog(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Record Debt Payment'),
+      content: SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(sale.customerName.isEmpty
+                ? 'Customer: -'
+                : 'Customer: ${sale.customerName}'),
+            const SizedBox(height: 4),
+            Text('Created: ${shortDateTime(sale.createdAt)}'),
+            const SizedBox(height: 4),
+            Text('Balance: ${store.moneyFor(balance)}',
+                style: const TextStyle(fontWeight: FontWeight.w900)),
+            const SizedBox(height: 12),
+            Field(
+                controller: amount,
+                label: 'Amount paid in ${store.displayCurrency}',
+                icon: Icons.payments,
+                required: true,
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true)),
+            const SizedBox(height: 8),
+            const Text(
+                'Partial payments are allowed. If the amount is more than the balance, only the remaining balance will be cleared.'),
+          ]),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton.icon(
+          onPressed: () async {
+            final cents = store.displayAmountToBaseCents(amount.text);
+            if (cents <= 0) {
+              showMessage(context, 'Enter a valid payment amount.');
+              return;
+            }
+            await store.settleDebt(sale, cents);
+            if (context.mounted) {
+              Navigator.pop(context);
+              showMessage(context, 'Debt payment recorded.');
+            }
+          },
+          icon: const Icon(Icons.check_circle),
+          label: const Text('Record Payment'),
+        ),
+      ],
+    ),
+  );
 }
 
 class VoidReturnsPanel extends StatelessWidget {
@@ -7743,6 +12123,20 @@ class TransferHistoryPanel extends StatelessWidget {
                         TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
               ),
               Chip(label: Text('${store.stockTransfers.length} recorded')),
+              IconButton(
+                  tooltip: 'Delete all transfer history',
+                  onPressed: store.stockTransfers.isEmpty
+                      ? null
+                      : () async {
+                          final confirmed = await confirmTypedDelete(
+                              context,
+                              'Delete transfer history?',
+                              'Type DELETE TRANSFERS to permanently delete all transfer history records.',
+                              'DELETE TRANSFERS');
+                          if (!confirmed) return;
+                          await store.deleteAllTransferHistory();
+                        },
+                  icon: const Icon(Icons.delete_sweep)),
             ]),
             const SizedBox(height: 8),
             if (records.isEmpty)
@@ -8227,6 +12621,8 @@ class _AdminPageState extends State<AdminPage> {
           const SizedBox(height: 12),
           CurrencySettingsPanel(store: widget.store),
           const SizedBox(height: 12),
+          AuditDashboardPanel(store: widget.store),
+          const SizedBox(height: 12),
         ],
         DecoratedPanel(
           child: Column(
@@ -8357,6 +12753,93 @@ class _AdminPageState extends State<AdminPage> {
           ),
         ],
       ],
+    );
+  }
+}
+
+class AuditDashboardPanel extends StatefulWidget {
+  const AuditDashboardPanel({required this.store, super.key});
+  final AppStore store;
+
+  @override
+  State<AuditDashboardPanel> createState() => _AuditDashboardPanelState();
+}
+
+class _AuditDashboardPanelState extends State<AuditDashboardPanel> {
+  bool allBranches = true;
+  String query = '';
+  DateTime? selectedDate;
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = widget.store.auditRows(allBranches: allBranches).where((row) {
+      if (selectedDate != null && !sameLocalDay(row.when, selectedDate!)) {
+        return false;
+      }
+      final q = query.trim().toLowerCase();
+      if (q.isEmpty) return true;
+      return row.action.toLowerCase().contains(q) ||
+          row.actor.toLowerCase().contains(q) ||
+          row.branch.toLowerCase().contains(q) ||
+          row.detail.toLowerCase().contains(q);
+    }).toList();
+    return DecoratedPanel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Audit Dashboard',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 6),
+        const Text(
+            'Owner view of sales, voids, transfers, accounting, stock counts, payroll, and supplier actions.'),
+        const SizedBox(height: 10),
+        TextField(
+          decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.search),
+              labelText: 'Search action, user, branch, or detail',
+              border: OutlineInputBorder()),
+          onChanged: (value) => setState(() => query = value),
+        ),
+        const SizedBox(height: 8),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          FilterChip(
+              selected: allBranches,
+              label: const Text('All branches'),
+              onSelected: (value) => setState(() => allBranches = value)),
+          OutlinedButton.icon(
+              onPressed: () async {
+                final picked = await showDatePicker(
+                    context: context,
+                    initialDate: selectedDate ?? DateTime.now(),
+                    firstDate: DateTime(2020),
+                    lastDate: DateTime.now().add(const Duration(days: 1)));
+                setState(() => selectedDate = picked);
+              },
+              icon: const Icon(Icons.calendar_month),
+              label: Text(selectedDate == null
+                  ? 'Choose Date'
+                  : shortDate(selectedDate!))),
+          if (selectedDate != null)
+            TextButton.icon(
+                onPressed: () => setState(() => selectedDate = null),
+                icon: const Icon(Icons.close),
+                label: const Text('Clear Date')),
+        ]),
+        const SizedBox(height: 10),
+        if (rows.isEmpty)
+          const Text('No audit records match this filter.')
+        else
+          ...rows.take(40).map((row) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.manage_search),
+                title: Text('${row.action} | ${row.branch}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w800)),
+                subtitle: Text(
+                    '${shortDateTime(row.when)} | ${row.actor} | ${row.detail}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis),
+              )),
+      ]),
     );
   }
 }
@@ -8537,20 +13020,248 @@ class ReceiptOutputService {
   static const MethodChannel _printChannel =
       MethodChannel('com.lightwinter.retailos/printing');
 
-  static Future<Uint8List> buildPdf(String receiptText) async {
+  static Future<Uint8List> buildPdf(String receiptText,
+      {bool brandedReport = false}) async {
     final doc = pw.Document();
-    doc.addPage(pw.Page(
-        build: (_) => pw.Padding(
-            padding: const pw.EdgeInsets.all(20),
-            child: pw.Text(receiptText,
-                style: const pw.TextStyle(fontSize: 11)))));
+    final lines = receiptText
+        .replaceAll('\r\n', '\n')
+        .split('\n')
+        .map((line) => line.trimRight())
+        .toList();
+    final title = lines.length > 1 && lines.first.contains('Light Winter')
+        ? lines[1].trim()
+        : 'RetailOS Document';
+    if (!brandedReport) {
+      doc.addPage(pw.MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(20),
+          build: (_) => [
+                pw.Text(receiptText,
+                    style: const pw.TextStyle(fontSize: 10, lineSpacing: 2)),
+              ]));
+    } else {
+      doc.addPage(pw.MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(24),
+          header: (_) => _pdfHeader(title),
+          footer: (context) => _pdfFooter(context),
+          build: (_) => _pdfBody(lines)));
+    }
     return doc.save();
   }
 
-  static Future<void> printNative(String receiptText) async {
+  static pw.Widget _pdfHeader(String title) {
+    return pw.Container(
+      margin: const pw.EdgeInsets.only(bottom: 14),
+      padding: const pw.EdgeInsets.all(12),
+      decoration: pw.BoxDecoration(
+        color: PdfColors.blueGrey900,
+        borderRadius: pw.BorderRadius.circular(8),
+      ),
+      child: pw.Row(
+        crossAxisAlignment: pw.CrossAxisAlignment.center,
+        children: [
+          pw.Container(
+            width: 42,
+            height: 42,
+            alignment: pw.Alignment.center,
+            decoration: pw.BoxDecoration(
+              color: PdfColors.white,
+              borderRadius: pw.BorderRadius.circular(8),
+            ),
+            child: pw.Text('LWT',
+                style: pw.TextStyle(
+                    color: PdfColors.teal800,
+                    fontSize: 14,
+                    fontWeight: pw.FontWeight.bold)),
+          ),
+          pw.SizedBox(width: 12),
+          pw.Expanded(
+            child: pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: [
+                pw.Text('Light Winter Technologies',
+                    style: pw.TextStyle(
+                        color: PdfColors.white,
+                        fontSize: 16,
+                        fontWeight: pw.FontWeight.bold)),
+                pw.SizedBox(height: 3),
+                pw.Text(title,
+                    style: const pw.TextStyle(
+                        color: PdfColors.cyan100, fontSize: 10)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static pw.Widget _pdfFooter(pw.Context context) {
+    return pw.Container(
+      margin: const pw.EdgeInsets.only(top: 10),
+      padding: const pw.EdgeInsets.only(top: 6),
+      decoration: const pw.BoxDecoration(
+        border: pw.Border(top: pw.BorderSide(color: PdfColors.grey300)),
+      ),
+      child: pw.Row(
+        mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+        children: [
+          pw.Text('Provided by Light Winter Technologies',
+              style: const pw.TextStyle(color: PdfColors.grey700, fontSize: 8)),
+          pw.Text('Page ${context.pageNumber} of ${context.pagesCount}',
+              style: const pw.TextStyle(color: PdfColors.grey700, fontSize: 8)),
+        ],
+      ),
+    );
+  }
+
+  static List<pw.Widget> _pdfBody(List<String> lines) {
+    final body = <pw.Widget>[];
+    for (var index = 0; index < lines.length; index++) {
+      final line = lines[index].trimRight();
+      if (index < 2 && lines.first.contains('Light Winter')) continue;
+      if (line.trim().isEmpty) {
+        body.add(pw.SizedBox(height: 6));
+      } else if (_isPdfSection(line)) {
+        body.add(_pdfSection(line));
+      } else if (_isPdfTransactionHeader(line)) {
+        body.add(_pdfTransactionHeader(line));
+      } else if (line.startsWith('  ')) {
+        body.add(_pdfIndentedLine(line.trim()));
+      } else if (_isPdfKeyValue(line)) {
+        body.add(_pdfKeyValue(line));
+      } else {
+        body.add(pw.Padding(
+          padding: const pw.EdgeInsets.only(bottom: 3),
+          child: pw.Text(line,
+              style: const pw.TextStyle(fontSize: 9, lineSpacing: 2)),
+        ));
+      }
+    }
+    return body;
+  }
+
+  static bool _isPdfSection(String line) {
+    return {
+      'Payment mix',
+      'High performing stock',
+      'Slow moving stock',
+      'User performance',
+      'Transaction details',
+      'Smart Business Insights',
+      'Revenue',
+      'Cost of Sales',
+      'Operating Expenses',
+      'Net Profit / Loss',
+      'Supplier and Customer Balances',
+      'Stock Position',
+      'Batch / Expiry Watch',
+      'Payroll / HR',
+      'Cashbook Summary',
+      'Debt Aging',
+      'Expense / Income Register',
+      'Accounting Entries',
+    }.contains(line.trim());
+  }
+
+  static bool _isPdfTransactionHeader(String line) {
+    return line.contains(' | Branch: ') && line.contains(' | ');
+  }
+
+  static bool _isPdfKeyValue(String line) {
+    if (line.startsWith('http')) return false;
+    final colon = line.indexOf(':');
+    return colon > 0 && colon < 42 && !line.contains(' | ');
+  }
+
+  static pw.Widget _pdfSection(String line) {
+    return pw.Container(
+      width: double.infinity,
+      margin: const pw.EdgeInsets.only(top: 8, bottom: 5),
+      padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: const pw.BoxDecoration(
+        color: PdfColors.blueGrey50,
+        border: pw.Border(
+          left: pw.BorderSide(color: PdfColors.teal700, width: 3),
+          bottom: pw.BorderSide(color: PdfColors.blueGrey100),
+        ),
+      ),
+      child: pw.Text(line,
+          style: pw.TextStyle(
+              color: PdfColors.blueGrey900,
+              fontSize: 11,
+              fontWeight: pw.FontWeight.bold)),
+    );
+  }
+
+  static pw.Widget _pdfTransactionHeader(String line) {
+    return pw.Container(
+      width: double.infinity,
+      margin: const pw.EdgeInsets.only(top: 6, bottom: 3),
+      padding: const pw.EdgeInsets.all(6),
+      decoration: pw.BoxDecoration(
+        color: PdfColors.grey100,
+        borderRadius: pw.BorderRadius.circular(5),
+        border: pw.Border.all(color: PdfColors.grey300),
+      ),
+      child: pw.Text(line,
+          style: pw.TextStyle(
+              fontSize: 8.5,
+              color: PdfColors.blueGrey900,
+              fontWeight: pw.FontWeight.bold)),
+    );
+  }
+
+  static pw.Widget _pdfIndentedLine(String line) {
+    return pw.Container(
+      margin: const pw.EdgeInsets.only(left: 12, bottom: 2),
+      padding: const pw.EdgeInsets.only(left: 6),
+      decoration: const pw.BoxDecoration(
+        border: pw.Border(left: pw.BorderSide(color: PdfColors.teal100)),
+      ),
+      child: pw.Text(line, style: const pw.TextStyle(fontSize: 8.5)),
+    );
+  }
+
+  static pw.Widget _pdfKeyValue(String line) {
+    final colon = line.indexOf(':');
+    final key = line.substring(0, colon).trim();
+    final value = line.substring(colon + 1).trim();
+    return pw.Container(
+      padding: const pw.EdgeInsets.symmetric(vertical: 2.5),
+      decoration: const pw.BoxDecoration(
+        border: pw.Border(bottom: pw.BorderSide(color: PdfColors.grey200)),
+      ),
+      child: pw.Row(
+        crossAxisAlignment: pw.CrossAxisAlignment.start,
+        children: [
+          pw.Expanded(
+            flex: 3,
+            child: pw.Text(key,
+                style: pw.TextStyle(
+                    fontSize: 9,
+                    color: PdfColors.blueGrey800,
+                    fontWeight: pw.FontWeight.bold)),
+          ),
+          pw.SizedBox(width: 8),
+          pw.Expanded(
+            flex: 5,
+            child: pw.Text(value.isEmpty ? '-' : value,
+                textAlign: pw.TextAlign.right,
+                style:
+                    const pw.TextStyle(fontSize: 9, color: PdfColors.grey900)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static Future<void> printNative(String receiptText,
+      {bool brandedReport = false}) async {
     await Printing.layoutPdf(
         name: 'Light Winter RetailOS Receipt',
-        onLayout: (_) => buildPdf(receiptText));
+        onLayout: (_) => buildPdf(receiptText, brandedReport: brandedReport));
   }
 
   static Future<bool> isSunmiDevice() async {
@@ -8572,8 +13283,9 @@ class ReceiptOutputService {
   }
 
   static Future<void> sharePdf(String receiptText,
-      {String filename = 'light-winter-retailos-receipt.pdf'}) async {
-    final bytes = await buildPdf(receiptText);
+      {String filename = 'light-winter-retailos-receipt.pdf',
+      bool brandedReport = false}) async {
+    final bytes = await buildPdf(receiptText, brandedReport: brandedReport);
     await Printing.sharePdf(bytes: bytes, filename: filename);
   }
 
@@ -8757,8 +13469,7 @@ Future<void> showWhatsAppReceiptDialog(
 
 Future<void> showStockExportDialog(BuildContext context, AppStore store) async {
   final csvText = store.exportCurrentStockCsv();
-  final filename =
-      'light-winter-stock-${localDateKey(DateTime.now())}.csv';
+  final filename = 'light-winter-stock-${localDateKey(DateTime.now())}.csv';
   final phone = TextEditingController();
   File? savedFile;
   bool busy = false;
@@ -8804,14 +13515,12 @@ Future<void> showStockExportDialog(BuildContext context, AppStore store) async {
                   : () async {
                       setState(() => busy = true);
                       try {
-                        savedFile = await ReceiptOutputService.saveCsv(
-                            csvText,
+                        savedFile = await ReceiptOutputService.saveCsv(csvText,
                             filename: filename);
                         await Clipboard.setData(
                             ClipboardData(text: savedFile!.path));
                         if (context.mounted) {
-                          showMessage(
-                              context, 'CSV saved. File path copied.');
+                          showMessage(context, 'CSV saved. File path copied.');
                         }
                       } catch (error) {
                         if (context.mounted) {
@@ -8873,6 +13582,964 @@ Future<void> showStockExportDialog(BuildContext context, AppStore store) async {
   );
 }
 
+Future<void> showAccountingEntryDialog(BuildContext context, AppStore store,
+    {required AccountingEntryType type}) async {
+  final amount = TextEditingController();
+  final description = TextEditingController();
+  final counterparty = TextEditingController();
+  final customCategory = TextEditingController();
+  String paymentMethod = 'Cash';
+  String category =
+      type == AccountingEntryType.expense ? 'Rent' : 'Owner cash injection';
+  final expenseCategories = [
+    'Rent',
+    'Wages',
+    'Transport',
+    'Electricity',
+    'Internet / airtime',
+    'Packaging',
+    'Repairs',
+    'Bank charges',
+    'Marketing',
+    'Licenses',
+    'Owner drawings',
+    'Other'
+  ];
+  final incomeCategories = [
+    'Owner cash injection',
+    'Owner capital',
+    'Service income',
+    'Delivery fee',
+    'Commission',
+    'Refund received',
+    'Other'
+  ];
+  final categories = type == AccountingEntryType.expense
+      ? expenseCategories
+      : incomeCategories;
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: Text(type == AccountingEntryType.expense
+            ? 'Add Expense'
+            : 'Add Other Income'),
+        content: SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              DropdownButtonFormField<String>(
+                value: category,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.category),
+                    labelText: 'Category',
+                    border: OutlineInputBorder()),
+                items: categories
+                    .map((item) => DropdownMenuItem(
+                        value: item,
+                        child: Text(item,
+                            maxLines: 1, overflow: TextOverflow.ellipsis)))
+                    .toList(),
+                onChanged: (value) =>
+                    setState(() => category = value ?? category),
+              ),
+              if (category == 'Other') ...[
+                const SizedBox(height: 10),
+                Field(
+                    controller: customCategory,
+                    label: 'Custom category',
+                    icon: Icons.edit),
+              ],
+              const SizedBox(height: 10),
+              Field(
+                  controller: description,
+                  label: type == AccountingEntryType.expense
+                      ? 'Expense description'
+                      : 'Income description',
+                  icon: Icons.notes,
+                  required: true),
+              Field(
+                  controller: amount,
+                  label: 'Amount in ${store.displayCurrency}',
+                  icon: Icons.payments,
+                  required: true,
+                  keyboardType: TextInputType.number),
+              Field(
+                  controller: counterparty,
+                  label: type == AccountingEntryType.expense
+                      ? 'Paid to / supplier'
+                      : 'Received from',
+                  icon: Icons.person),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                value: paymentMethod,
+                decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.wallet),
+                    labelText: 'Payment method',
+                    border: OutlineInputBorder()),
+                items: const [
+                  DropdownMenuItem(value: 'Cash', child: Text('Cash')),
+                  DropdownMenuItem(value: 'Card', child: Text('Card')),
+                  DropdownMenuItem(
+                      value: 'Mobile money', child: Text('Mobile money')),
+                  DropdownMenuItem(
+                      value: 'Bank transfer', child: Text('Bank transfer')),
+                  DropdownMenuItem(value: 'Other', child: Text('Other')),
+                ],
+                onChanged: (value) =>
+                    setState(() => paymentMethod = value ?? paymentMethod),
+              ),
+            ]),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () async {
+                final cents = store.displayAmountToBaseCents(amount.text);
+                final label =
+                    category == 'Other' && customCategory.text.trim().isNotEmpty
+                        ? customCategory.text.trim()
+                        : category;
+                if (description.text.trim().isEmpty || cents <= 0) {
+                  showMessage(context, 'Enter a description and valid amount.');
+                  return;
+                }
+                await store.addAccountingEntry(AccountingEntry(
+                    id: newId(),
+                    branchId: store.assignedBranchId ?? '',
+                    type: type,
+                    category: label,
+                    description: description.text.trim(),
+                    amountCents: cents,
+                    paymentMethod: paymentMethod,
+                    counterparty: counterparty.text.trim(),
+                    createdAt: DateTime.now()));
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Save')),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showStockPurchaseDialog(
+    BuildContext context, AppStore store) async {
+  Product? product = store.products.isEmpty ? null : store.products.first;
+  final manualProduct = TextEditingController();
+  final supplier = TextEditingController();
+  final quantity = TextEditingController(text: '1');
+  final total = TextEditingController();
+  final paid = TextEditingController(text: '0');
+  final batch = TextEditingController();
+  DateTime? expiryDate;
+  String paymentMethod = 'Cash';
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Record Stock Purchase'),
+        content: SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 460),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              if (store.products.isNotEmpty)
+                DropdownButtonFormField<String>(
+                  value: product?.id,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                      prefixIcon: Icon(Icons.inventory_2),
+                      labelText: 'Product to restock',
+                      border: OutlineInputBorder()),
+                  items: store.products
+                      .map((item) => DropdownMenuItem(
+                          value: item.id,
+                          child: Text(item.name,
+                              maxLines: 1, overflow: TextOverflow.ellipsis)))
+                      .toList(),
+                  onChanged: (value) => setState(() => product = store.products
+                      .where((item) => item.id == value)
+                      .firstOrNull),
+                )
+              else
+                Field(
+                    controller: manualProduct,
+                    label: 'Product / purchase name',
+                    icon: Icons.inventory_2,
+                    required: true),
+              const SizedBox(height: 10),
+              Field(
+                  controller: supplier,
+                  label: 'Supplier name',
+                  icon: Icons.local_shipping,
+                  required: true),
+              Field(
+                  controller: quantity,
+                  label: 'Quantity received',
+                  icon: Icons.add_box,
+                  keyboardType: TextInputType.number),
+              Field(
+                  controller: total,
+                  label: 'Total invoice amount in ${store.displayCurrency}',
+                  icon: Icons.receipt_long,
+                  required: true,
+                  keyboardType: TextInputType.number),
+              Field(
+                  controller: paid,
+                  label: 'Amount paid now in ${store.displayCurrency}',
+                  icon: Icons.payments,
+                  keyboardType: TextInputType.number),
+              Field(
+                  controller: batch,
+                  label: 'Batch number (optional)',
+                  icon: Icons.qr_code_2),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: OutlinedButton.icon(
+                    onPressed: () async {
+                      final picked = await showDatePicker(
+                          context: context,
+                          initialDate:
+                              DateTime.now().add(const Duration(days: 90)),
+                          firstDate: DateTime(2020),
+                          lastDate:
+                              DateTime.now().add(const Duration(days: 3650)));
+                      if (picked != null) setState(() => expiryDate = picked);
+                    },
+                    icon: const Icon(Icons.event),
+                    label: Text(expiryDate == null
+                        ? 'Expiry date (optional)'
+                        : 'Expiry: ${shortDate(expiryDate!)}')),
+              ),
+              DropdownButtonFormField<String>(
+                value: paymentMethod,
+                decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.wallet),
+                    labelText: 'Payment method',
+                    border: OutlineInputBorder()),
+                items: const [
+                  DropdownMenuItem(value: 'Cash', child: Text('Cash')),
+                  DropdownMenuItem(value: 'Card', child: Text('Card')),
+                  DropdownMenuItem(
+                      value: 'Mobile money', child: Text('Mobile money')),
+                  DropdownMenuItem(
+                      value: 'Bank transfer', child: Text('Bank transfer')),
+                ],
+                onChanged: (value) =>
+                    setState(() => paymentMethod = value ?? paymentMethod),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                  'If paid now is less than the invoice amount, the remaining balance becomes supplier debt.'),
+            ]),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton.icon(
+              onPressed: () async {
+                final totalCents = store.displayAmountToBaseCents(total.text);
+                final paidCents = store.displayAmountToBaseCents(paid.text);
+                final qty = int.tryParse(quantity.text.trim()) ?? 0;
+                final name = product?.name ?? manualProduct.text.trim();
+                if (name.isEmpty ||
+                    supplier.text.trim().isEmpty ||
+                    totalCents <= 0) {
+                  showMessage(context,
+                      'Choose a product, supplier, and valid invoice amount.');
+                  return;
+                }
+                await store.recordStockPurchase(
+                    product: product,
+                    productName: name,
+                    supplierName: supplier.text.trim(),
+                    quantity: qty,
+                    totalCents: totalCents,
+                    paidCents: paidCents,
+                    paymentMethod: paymentMethod,
+                    batchNumber: batch.text.trim(),
+                    expiryDate: expiryDate);
+                if (context.mounted) Navigator.pop(context);
+              },
+              icon: const Icon(Icons.check_circle),
+              label: const Text('Save Purchase')),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showSupplierPaymentDialog(
+    BuildContext context, AppStore store) async {
+  final supplier = TextEditingController();
+  final amount = TextEditingController();
+  String paymentMethod = 'Cash';
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Pay Supplier'),
+        content: SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Field(
+                  controller: supplier,
+                  label: 'Supplier name',
+                  icon: Icons.local_shipping,
+                  required: true),
+              Field(
+                  controller: amount,
+                  label: 'Amount paid in ${store.displayCurrency}',
+                  icon: Icons.payments,
+                  required: true,
+                  keyboardType: TextInputType.number),
+              DropdownButtonFormField<String>(
+                value: paymentMethod,
+                decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.wallet),
+                    labelText: 'Payment method',
+                    border: OutlineInputBorder()),
+                items: const [
+                  DropdownMenuItem(value: 'Cash', child: Text('Cash')),
+                  DropdownMenuItem(value: 'Card', child: Text('Card')),
+                  DropdownMenuItem(
+                      value: 'Mobile money', child: Text('Mobile money')),
+                  DropdownMenuItem(
+                      value: 'Bank transfer', child: Text('Bank transfer')),
+                ],
+                onChanged: (value) =>
+                    setState(() => paymentMethod = value ?? paymentMethod),
+              ),
+            ]),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () async {
+                final cents = store.displayAmountToBaseCents(amount.text);
+                if (supplier.text.trim().isEmpty || cents <= 0) {
+                  showMessage(context, 'Enter supplier name and valid amount.');
+                  return;
+                }
+                await store.addAccountingEntry(AccountingEntry(
+                    id: newId(),
+                    branchId: store.assignedBranchId ?? '',
+                    type: AccountingEntryType.expense,
+                    category: 'Supplier Payment',
+                    description: 'Supplier payment',
+                    amountCents: cents,
+                    paymentMethod: paymentMethod,
+                    counterparty: supplier.text.trim(),
+                    createdAt: DateTime.now()));
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Save Payment')),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showPayrollDialog(BuildContext context, AppStore store) async {
+  final employee = TextEditingController();
+  final role = TextEditingController();
+  final period = TextEditingController(
+      text:
+          '${DateTime.now().year}-${DateTime.now().month.toString().padLeft(2, '0')}');
+  final gross = TextEditingController();
+  final deductions = TextEditingController(text: '0');
+  final note = TextEditingController();
+  String paymentMethod = 'Cash';
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Payroll / Light HR'),
+        content: SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 440),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Field(
+                  controller: employee,
+                  label: 'Employee name',
+                  icon: Icons.person,
+                  required: true),
+              Field(
+                  controller: role,
+                  label: 'Role / position',
+                  icon: Icons.badge),
+              Field(
+                  controller: period,
+                  label: 'Pay period',
+                  icon: Icons.calendar_month,
+                  required: true),
+              Field(
+                  controller: gross,
+                  label: 'Gross pay in ${store.displayCurrency}',
+                  icon: Icons.payments,
+                  required: true,
+                  keyboardType: TextInputType.number),
+              Field(
+                  controller: deductions,
+                  label: 'Deductions in ${store.displayCurrency}',
+                  icon: Icons.remove_circle,
+                  keyboardType: TextInputType.number),
+              Field(controller: note, label: 'Notes', icon: Icons.note_alt),
+              DropdownButtonFormField<String>(
+                value: paymentMethod,
+                decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.wallet),
+                    labelText: 'Payment method',
+                    border: OutlineInputBorder()),
+                items: const [
+                  DropdownMenuItem(value: 'Cash', child: Text('Cash')),
+                  DropdownMenuItem(
+                      value: 'Bank transfer', child: Text('Bank transfer')),
+                  DropdownMenuItem(
+                      value: 'Mobile money', child: Text('Mobile money')),
+                ],
+                onChanged: (value) =>
+                    setState(() => paymentMethod = value ?? paymentMethod),
+              ),
+            ]),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton.icon(
+            onPressed: () async {
+              final grossCents = store.displayAmountToBaseCents(gross.text);
+              final deductionCents =
+                  store.displayAmountToBaseCents(deductions.text);
+              final netCents = max(0, grossCents - deductionCents);
+              if (employee.text.trim().isEmpty || grossCents <= 0) {
+                showMessage(
+                    context, 'Enter employee name and valid gross pay.');
+                return;
+              }
+              await store.addAccountingEntry(AccountingEntry(
+                  id: newId(),
+                  branchId: store.assignedBranchId ?? '',
+                  type: AccountingEntryType.expense,
+                  category: 'Payroll',
+                  description:
+                      '${period.text.trim()} | ${role.text.trim().isEmpty ? 'Employee' : role.text.trim()} | Gross ${store.moneyFor(grossCents)} | Deductions ${store.moneyFor(deductionCents)}${note.text.trim().isEmpty ? '' : ' | ${note.text.trim()}'}',
+                  amountCents: netCents,
+                  paymentMethod: paymentMethod,
+                  counterparty: employee.text.trim(),
+                  createdAt: DateTime.now()));
+              if (context.mounted) Navigator.pop(context);
+            },
+            icon: const Icon(Icons.check_circle),
+            label: const Text('Save Payroll'),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showPurchaseOrderDialog(
+    BuildContext context, AppStore store) async {
+  Product? product = store.products.isEmpty ? null : store.products.first;
+  final manualProduct = TextEditingController();
+  final supplier = TextEditingController();
+  final quantity = TextEditingController(text: '1');
+  final amount = TextEditingController();
+  final note = TextEditingController();
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Create Purchase Order'),
+        content: SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 460),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              if (store.products.isNotEmpty)
+                DropdownButtonFormField<String>(
+                  value: product?.id,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                      prefixIcon: Icon(Icons.inventory_2),
+                      labelText: 'Product',
+                      border: OutlineInputBorder()),
+                  items: store.products
+                      .map((item) => DropdownMenuItem(
+                          value: item.id,
+                          child: Text(item.name,
+                              maxLines: 1, overflow: TextOverflow.ellipsis)))
+                      .toList(),
+                  onChanged: (value) => setState(() => product = store.products
+                      .where((item) => item.id == value)
+                      .firstOrNull),
+                )
+              else
+                Field(
+                    controller: manualProduct,
+                    label: 'Product name',
+                    icon: Icons.inventory_2,
+                    required: true),
+              const SizedBox(height: 10),
+              Field(
+                  controller: supplier,
+                  label: 'Supplier',
+                  icon: Icons.local_shipping,
+                  required: true),
+              Field(
+                  controller: quantity,
+                  label: 'Quantity ordered',
+                  icon: Icons.add_box,
+                  keyboardType: TextInputType.number),
+              Field(
+                  controller: amount,
+                  label: 'Expected amount in ${store.displayCurrency}',
+                  icon: Icons.payments,
+                  keyboardType: TextInputType.number),
+              Field(controller: note, label: 'Note', icon: Icons.notes),
+            ]),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () async {
+                final name = product?.name ?? manualProduct.text.trim();
+                final qty = int.tryParse(quantity.text.trim()) ?? 0;
+                final cents = store.displayAmountToBaseCents(amount.text);
+                if (name.isEmpty || supplier.text.trim().isEmpty || qty <= 0) {
+                  showMessage(context,
+                      'Enter product, supplier, and quantity ordered.');
+                  return;
+                }
+                await store.addAccountingEntry(AccountingEntry(
+                    id: newId(),
+                    branchId: store.assignedBranchId ?? '',
+                    type: AccountingEntryType.expense,
+                    category: 'Purchase Order',
+                    description:
+                        'Order $qty x $name${note.text.trim().isEmpty ? '' : ' - ${note.text.trim()}'}',
+                    amountCents: cents,
+                    paymentMethod: 'Not received',
+                    counterparty: supplier.text.trim(),
+                    createdAt: DateTime.now()));
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Save Order')),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showStockCountDialog(BuildContext context, AppStore store) async {
+  Product? product = store.branchScopedProducts.isEmpty
+      ? null
+      : store.branchScopedProducts.first;
+  final counted = TextEditingController();
+  final reason = TextEditingController(text: 'Physical stock count');
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Stock Count'),
+        content: SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 460),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              DropdownButtonFormField<String>(
+                value: product?.id,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.fact_check),
+                    labelText: 'Product counted',
+                    border: OutlineInputBorder()),
+                items: store.branchScopedProducts
+                    .map((item) => DropdownMenuItem(
+                        value: item.id,
+                        child: Text(item.name,
+                            maxLines: 1, overflow: TextOverflow.ellipsis)))
+                    .toList(),
+                onChanged: (value) => setState(() => product = store
+                    .branchScopedProducts
+                    .where((item) => item.id == value)
+                    .firstOrNull),
+              ),
+              const SizedBox(height: 10),
+              Field(
+                  controller: counted,
+                  label: 'Physical quantity counted',
+                  icon: Icons.numbers,
+                  required: true,
+                  keyboardType: TextInputType.number),
+              Field(
+                  controller: reason,
+                  label: 'Reason',
+                  icon: Icons.notes,
+                  required: true),
+            ]),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: product == null
+                  ? null
+                  : () async {
+                      final qty = int.tryParse(counted.text.trim());
+                      if (qty == null ||
+                          qty < 0 ||
+                          reason.text.trim().isEmpty) {
+                        showMessage(context,
+                            'Enter counted quantity and adjustment reason.');
+                        return;
+                      }
+                      await store.recordStockCount(
+                          product: product!,
+                          countedQuantity: qty,
+                          reason: reason.text.trim());
+                      if (context.mounted) Navigator.pop(context);
+                    },
+              child: const Text('Save Count')),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showCashUpDialog(
+    BuildContext context, AppStore store, ProfitLossStatement statement) async {
+  final counted = TextEditingController();
+  final note = TextEditingController();
+  final expectedCash = statement.cashbookByMethod['Cash in']! -
+      statement.cashbookByMethod['Cash out']!;
+  await showDialog(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Daily Cash-Up'),
+      content: SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Expected cash: ${store.moneyFor(expectedCash)}',
+                style: const TextStyle(fontWeight: FontWeight.w900)),
+            const SizedBox(height: 10),
+            Field(
+                controller: counted,
+                label: 'Actual counted cash in ${store.displayCurrency}',
+                icon: Icons.point_of_sale,
+                required: true,
+                keyboardType: TextInputType.number),
+            Field(controller: note, label: 'Note', icon: Icons.notes),
+          ]),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton(
+            onPressed: () async {
+              final countedCents = store.displayAmountToBaseCents(counted.text);
+              final difference = countedCents - expectedCash;
+              await store.addAccountingEntry(AccountingEntry(
+                  id: newId(),
+                  branchId: store.assignedBranchId ?? '',
+                  type: AccountingEntryType.expense,
+                  category: 'Cash-Up',
+                  description:
+                      'Expected ${store.moneyFor(expectedCash)}, counted ${store.moneyFor(countedCents)}, difference ${store.moneyFor(difference)}${note.text.trim().isEmpty ? '' : ' - ${note.text.trim()}'}',
+                  amountCents: difference.abs(),
+                  paymentMethod: difference >= 0 ? 'Surplus' : 'Shortage',
+                  counterparty: store.currentUser?.name ?? '',
+                  createdAt: DateTime.now()));
+              if (context.mounted) Navigator.pop(context);
+            },
+            child: const Text('Save Cash-Up')),
+      ],
+    ),
+  );
+}
+
+Future<void> showReconciliationDialog(
+    BuildContext context, AppStore store, ProfitLossStatement statement) async {
+  final actual = TextEditingController();
+  final reference = TextEditingController();
+  String method = 'Bank';
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Payment Reconciliation'),
+        content: SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              DropdownButtonFormField<String>(
+                value: method,
+                decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.account_balance),
+                    labelText: 'Account',
+                    border: OutlineInputBorder()),
+                items: const [
+                  DropdownMenuItem(value: 'Bank', child: Text('Bank')),
+                  DropdownMenuItem(
+                      value: 'Mobile money', child: Text('Mobile money')),
+                  DropdownMenuItem(value: 'Card', child: Text('Card')),
+                ],
+                onChanged: (value) => setState(() => method = value ?? method),
+              ),
+              const SizedBox(height: 10),
+              Field(
+                  controller: actual,
+                  label: 'Statement amount in ${store.displayCurrency}',
+                  icon: Icons.payments,
+                  required: true,
+                  keyboardType: TextInputType.number),
+              Field(
+                  controller: reference,
+                  label: 'Reference / note',
+                  icon: Icons.notes),
+            ]),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () async {
+                final amount = store.displayAmountToBaseCents(actual.text);
+                if (amount <= 0) {
+                  showMessage(context, 'Enter a valid statement amount.');
+                  return;
+                }
+                await store.addAccountingEntry(AccountingEntry(
+                    id: newId(),
+                    branchId: store.assignedBranchId ?? '',
+                    type: AccountingEntryType.income,
+                    category: 'Reconciliation',
+                    description:
+                        '$method statement checked${reference.text.trim().isEmpty ? '' : ' - ${reference.text.trim()}'}',
+                    amountCents: amount,
+                    paymentMethod: method,
+                    counterparty: store.currentUser?.name ?? '',
+                    createdAt: DateTime.now()));
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Save')),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showSupplierStatementDialog(
+    BuildContext context, AppStore store) async {
+  final supplier = TextEditingController();
+  await showDialog(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Supplier Statement'),
+      content: Field(
+          controller: supplier,
+          label: 'Supplier name',
+          icon: Icons.local_shipping,
+          required: true),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton.icon(
+            onPressed: () async {
+              if (supplier.text.trim().isEmpty) {
+                showMessage(context, 'Enter supplier name.');
+                return;
+              }
+              await ReceiptOutputService.sharePdf(
+                  store.supplierStatementText(supplier.text.trim()),
+                  filename: 'light-winter-supplier-statement.pdf',
+                  brandedReport: true);
+              if (context.mounted) Navigator.pop(context);
+            },
+            icon: const Icon(Icons.picture_as_pdf),
+            label: const Text('PDF / WhatsApp')),
+      ],
+    ),
+  );
+}
+
+Future<void> showCustomerStatementDialog(
+    BuildContext context, AppStore store) async {
+  SaleRecord? sale =
+      store.allKnownDebtSales.isEmpty ? null : store.allKnownDebtSales.first;
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Customer Statement'),
+        content: DropdownButtonFormField<String>(
+          value: sale?.id,
+          isExpanded: true,
+          decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.person),
+              labelText: 'Customer / debt sale',
+              border: OutlineInputBorder()),
+          items: store.allKnownDebtSales
+              .map((item) => DropdownMenuItem(
+                  value: item.id,
+                  child: Text(
+                      '${item.customerName.isEmpty ? 'Customer' : item.customerName} | ${shortDateTime(item.createdAt)} | ${store.moneyFor(store.debtBalanceForSale(item))}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis)))
+              .toList(),
+          onChanged: (value) => setState(() => sale = store.allKnownDebtSales
+              .where((item) => item.id == value)
+              .firstOrNull),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton.icon(
+              onPressed: sale == null
+                  ? null
+                  : () async {
+                      await ReceiptOutputService.sharePdf(
+                          store.customerStatementText(sale!),
+                          filename: 'light-winter-customer-statement.pdf',
+                          brandedReport: true);
+                      if (context.mounted) Navigator.pop(context);
+                    },
+              icon: const Icon(Icons.picture_as_pdf),
+              label: const Text('PDF / WhatsApp')),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showCustomerHistoryDialog(
+    BuildContext context, AppStore store) async {
+  Customer? customer = store.customers.isEmpty ? null : store.customers.first;
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Customer Purchase History'),
+        content: DropdownButtonFormField<String>(
+          value: customer?.id,
+          isExpanded: true,
+          decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.person_search),
+              labelText: 'Customer',
+              border: OutlineInputBorder()),
+          items: store.customers
+              .map((item) => DropdownMenuItem(
+                  value: item.id,
+                  child: Text('${item.code} | ${item.name}',
+                      maxLines: 1, overflow: TextOverflow.ellipsis)))
+              .toList(),
+          onChanged: (value) => setState(() => customer =
+              store.customers.where((item) => item.id == value).firstOrNull),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton.icon(
+              onPressed: customer == null
+                  ? null
+                  : () async {
+                      await ReceiptOutputService.sharePdf(
+                          store.customerPurchaseHistoryText(customer!.name),
+                          filename:
+                              'light-winter-customer-purchase-history.pdf',
+                          brandedReport: true);
+                      if (context.mounted) Navigator.pop(context);
+                    },
+              icon: const Icon(Icons.picture_as_pdf),
+              label: const Text('PDF / WhatsApp')),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> showOldReceiptDialog(BuildContext context, AppStore store) async {
+  SaleRecord? sale =
+      store.allKnownSales.isEmpty ? null : store.allKnownSales.first;
+  await showDialog(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('Old Receipt'),
+        content: DropdownButtonFormField<String>(
+          value: sale?.id,
+          isExpanded: true,
+          decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.receipt),
+              labelText: 'Sale receipt',
+              border: OutlineInputBorder()),
+          items: store.allKnownSales
+              .take(200)
+              .map((item) => DropdownMenuItem(
+                  value: item.id,
+                  child: Text(
+                      '${shortDateTime(item.createdAt)} | ${item.customerName.isEmpty ? item.paymentMethod : item.customerName} | ${store.moneyFor(item.totalCents)}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis)))
+              .toList(),
+          onChanged: (value) =>
+              setState(() => sale = store.saleById(value ?? '')),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          OutlinedButton.icon(
+              onPressed: sale == null
+                  ? null
+                  : () async {
+                      await ReceiptOutputService.sharePdf(
+                          store.receiptText(sale!),
+                          filename: 'light-winter-receipt-${sale!.id}.pdf');
+                    },
+              icon: const Icon(Icons.picture_as_pdf),
+              label: const Text('PDF / WhatsApp')),
+          FilledButton.icon(
+              onPressed: sale == null
+                  ? null
+                  : () async {
+                      await ReceiptOutputService.printNative(
+                          store.receiptText(sale!));
+                    },
+              icon: const Icon(Icons.print),
+              label: const Text('Print')),
+        ],
+      ),
+    ),
+  );
+}
+
 Future<void> showCustomItemDialog(BuildContext context, AppStore store) async {
   final name = TextEditingController();
   final price = TextEditingController();
@@ -8916,11 +14583,15 @@ Future<void> showCustomItemDialog(BuildContext context, AppStore store) async {
 Future<SaleRecord?> showCheckoutDialog(
     BuildContext context, AppStore store) async {
   String paymentMethod = 'Cash';
+  String currency = store.posCurrency;
   final discount = TextEditingController(text: '0');
   final paid = TextEditingController(
       text: ((store.cartTotalCents / 100) *
-              (store.exchangeRates[store.displayCurrency] ?? 1))
+              (store.exchangeRates[store.posCurrency] ?? 1))
           .toStringAsFixed(2));
+  final splitCash = TextEditingController(text: '0');
+  final splitCard = TextEditingController(text: '0');
+  final splitMobile = TextEditingController(text: '0');
   final customerName = TextEditingController();
   final customerPhone = TextEditingController();
   bool completing = false;
@@ -8930,13 +14601,21 @@ Future<SaleRecord?> showCheckoutDialog(
     context: context,
     builder: (context) => StatefulBuilder(
       builder: (context, setState) {
-        final currency = store.displayCurrency;
         final discountCents =
             store.displayAmountToBaseCents(discount.text, currency: currency);
         final totalCents =
             (store.cartTotalCents - discountCents).clamp(0, 1 << 31).toInt();
-        final paidCents =
-            store.displayAmountToBaseCents(paid.text, currency: currency);
+        final splitCashCents =
+            store.displayAmountToBaseCents(splitCash.text, currency: currency);
+        final splitCardCents =
+            store.displayAmountToBaseCents(splitCard.text, currency: currency);
+        final splitMobileCents = store
+            .displayAmountToBaseCents(splitMobile.text, currency: currency);
+        final splitTotalCents =
+            splitCashCents + splitCardCents + splitMobileCents;
+        final paidCents = paymentMethod == 'Split'
+            ? splitTotalCents
+            : store.displayAmountToBaseCents(paid.text, currency: currency);
         final debtCents = (totalCents - paidCents).clamp(0, 1 << 31).toInt();
         final changeCents = (paidCents - totalCents).clamp(0, 1 << 31).toInt();
         return AlertDialog(
@@ -8959,11 +14638,12 @@ Future<SaleRecord?> showCheckoutDialog(
                     children: ['USD', 'ZWL', 'ZAR', 'BWP']
                         .map((code) => ChoiceChip(
                               label: Text(code),
-                              selected: store.displayCurrency == code,
+                              selected: currency == code,
                               onSelected: completing
                                   ? null
                                   : (_) => setState(() {
-                                        store.setDisplayCurrency(code);
+                                        currency = code;
+                                        store.setPosCurrency(code);
                                         paid.text = ((totalCents / 100) *
                                                 (store.exchangeRates[code] ??
                                                     1))
@@ -8975,7 +14655,7 @@ Future<SaleRecord?> showCheckoutDialog(
                 if (!reviewing) const SizedBox(height: 12),
                 DropdownButtonFormField<String>(
                   initialValue: paymentMethod,
-                  items: const ['Cash', 'Card', 'Mobile Money', 'Debt']
+                  items: const ['Cash', 'Card', 'Mobile Money', 'Split', 'Debt']
                       .map((item) =>
                           DropdownMenuItem(value: item, child: Text(item)))
                       .toList(),
@@ -9016,34 +14696,59 @@ Future<SaleRecord?> showCheckoutDialog(
                       label: 'Customer phone',
                       icon: Icons.phone),
                 ],
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 10),
-                  child: TextFormField(
-                    controller: paid,
-                    enabled: !completing && !reviewing,
-                    keyboardType: TextInputType.number,
-                    onChanged: (_) => setState(() {}),
-                    decoration: InputDecoration(
-                        prefixIcon: const Icon(Icons.payments),
-                        labelText: paymentMethod == 'Debt'
-                            ? 'Amount paid now in $currency'
-                            : 'Amount received in $currency',
-                        border: const OutlineInputBorder()),
+                if (paymentMethod == 'Split') ...[
+                  Field(
+                      controller: splitCash,
+                      label: 'Cash amount in $currency',
+                      icon: Icons.payments,
+                      keyboardType: TextInputType.number),
+                  Field(
+                      controller: splitCard,
+                      label: 'Card amount in $currency',
+                      icon: Icons.credit_card,
+                      keyboardType: TextInputType.number),
+                  Field(
+                      controller: splitMobile,
+                      label: 'Mobile money amount in $currency',
+                      icon: Icons.phone_android,
+                      keyboardType: TextInputType.number),
+                ] else
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: TextFormField(
+                      controller: paid,
+                      enabled: !completing && !reviewing,
+                      keyboardType: TextInputType.number,
+                      onChanged: (_) => setState(() {}),
+                      decoration: InputDecoration(
+                          prefixIcon: const Icon(Icons.payments),
+                          labelText: paymentMethod == 'Debt'
+                              ? 'Amount paid now in $currency'
+                              : 'Amount received in $currency',
+                          border: const OutlineInputBorder()),
+                    ),
                   ),
-                ),
                 const Divider(height: 24),
                 TotalRow(
                     label: 'Subtotal',
-                    value: store.moneyFor(store.cartTotalCents)),
+                    value: store.moneyFor(store.cartTotalCents,
+                        currency: currency)),
                 TotalRow(
-                    label: 'Discount', value: store.moneyFor(discountCents)),
+                    label: 'Discount',
+                    value: store.moneyFor(discountCents, currency: currency)),
                 TotalRow(
                     label: 'Total',
-                    value: store.moneyFor(totalCents),
+                    value: store.moneyFor(totalCents, currency: currency),
                     bold: true),
-                TotalRow(label: 'Paid', value: store.moneyFor(paidCents)),
-                TotalRow(label: 'Change', value: store.moneyFor(changeCents)),
-                TotalRow(label: 'Debt', value: store.moneyFor(debtCents)),
+                TotalRow(
+                    label: 'Paid',
+                    value: store.moneyFor(paidCents, currency: currency)),
+                TotalRow(
+                    label: 'Change',
+                    value: store.moneyFor(changeCents, currency: currency)),
+                TotalRow(
+                    label: 'Debt',
+                    value: store.moneyFor(debtCents, currency: currency)),
               ],
             ),
           ),
@@ -9068,6 +14773,11 @@ Future<SaleRecord?> showCheckoutDialog(
                             context, 'Customer name is required for debt.');
                         return;
                       }
+                      if (store.discountExceedsCashierLimit(discountCents)) {
+                        showMessage(context,
+                            'Discount is above cashier limit. Ask owner/manager.');
+                        return;
+                      }
                       if (!reviewing) {
                         setState(() => reviewing = true);
                         return;
@@ -9081,7 +14791,9 @@ Future<SaleRecord?> showCheckoutDialog(
                               customerPhone.text.trim());
                         }
                         final sale = await store.checkout(
-                          paymentMethod,
+                          paymentMethod == 'Split'
+                              ? 'Split: Cash ${store.moneyFor(splitCashCents, currency: currency)}, Card ${store.moneyFor(splitCardCents, currency: currency)}, Mobile ${store.moneyFor(splitMobileCents, currency: currency)}'
+                              : paymentMethod,
                           customer: customer,
                           discountCents: discountCents,
                           paidCents: paidCents,
@@ -9110,6 +14822,39 @@ Future<SaleRecord?> showCheckoutDialog(
   );
 }
 
+Future<void> showCartQuantityDialog(
+    BuildContext context, AppStore store, CartItem item) async {
+  final quantity = TextEditingController(text: '${item.quantity}');
+  await showDialog(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: Text('Quantity - ${item.product.name}'),
+      content: Field(
+          controller: quantity,
+          label: 'Quantity',
+          icon: Icons.numbers,
+          required: true,
+          keyboardType: TextInputType.number),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton(
+            onPressed: () {
+              final qty = int.tryParse(quantity.text.trim());
+              if (qty == null || qty < 0) {
+                showMessage(context, 'Enter a valid quantity.');
+                return;
+              }
+              store.setCartItemQuantity(item, qty);
+              Navigator.pop(context);
+            },
+            child: const Text('Set Quantity')),
+      ],
+    ),
+  );
+}
+
 Future<void> showProductDialog(BuildContext context, AppStore store,
     {Product? product}) async {
   final editing = product != null;
@@ -9117,6 +14862,10 @@ Future<void> showProductDialog(BuildContext context, AppStore store,
   final category = TextEditingController(text: product?.category ?? '');
   final sku = TextEditingController(text: product?.sku ?? '');
   final barcode = TextEditingController(text: product?.barcode ?? '');
+  final cost = TextEditingController(
+      text: product == null || product.costCents <= 0
+          ? ''
+          : (product.costCents / 100).toStringAsFixed(2));
   final price = TextEditingController(
       text:
           product == null ? '' : (product.priceCents / 100).toStringAsFixed(2));
@@ -9165,8 +14914,13 @@ Future<void> showProductDialog(BuildContext context, AppStore store,
               Field(controller: sku, label: 'SKU', icon: Icons.tag),
               Field(controller: barcode, label: 'Barcode', icon: Icons.qr_code),
               Field(
+                  controller: cost,
+                  label: 'Buying cost in USD',
+                  icon: Icons.shopping_bag,
+                  keyboardType: TextInputType.number),
+              Field(
                   controller: price,
-                  label: 'Price in USD',
+                  label: 'Selling price in USD',
                   icon: Icons.attach_money,
                   required: true,
                   keyboardType: TextInputType.number),
@@ -9208,6 +14962,7 @@ Future<void> showProductDialog(BuildContext context, AppStore store,
             onPressed: () async {
               final productName = name.text.trim();
               final cents = parseMoneyCents(price.text);
+              final costCents = parseMoneyCents(cost.text);
               if (productName.isEmpty || cents <= 0) {
                 showMessage(
                     context, 'Product name and valid price are required.');
@@ -9220,6 +14975,7 @@ Future<void> showProductDialog(BuildContext context, AppStore store,
                   sku: sku.text.trim(),
                   barcode: barcode.text.trim(),
                   priceCents: cents,
+                  costCents: costCents,
                   stock: int.tryParse(stock.text.trim()) ?? 0,
                   reorderLevel: int.tryParse(reorder.text.trim()) ?? 5,
                   supplierId: supplierId);
@@ -9497,7 +15253,7 @@ Future<void> importProductCsv(BuildContext context, AppStore store) async {
     final products = productsFromCsv(text, store);
     if (products.isEmpty) {
       throw StateError(
-          'No products found. CSV columns should include Product Name, Product Category, SKU number, Price, Initial Stock, Low Stock Threshold, and optionally Supplier.');
+          'No products found. CSV columns should include Product Name, Product Category, SKU number, Cost Price, Selling Price, Initial Stock, Low Stock Threshold, and optionally Supplier.');
     }
     await store.importProducts(products);
     if (context.mounted) {
@@ -9547,7 +15303,10 @@ List<Product> productsFromCsv(String text, AppStore store) {
       category: value(['productcategory', 'category']),
       sku: value(['skunumber', 'sku']),
       barcode: value(['barcode']),
-      priceCents: parseMoneyCents(value(['price', 'sellingprice'])),
+      priceCents:
+          parseMoneyCents(value(['sellingprice', 'price', 'retailprice'])),
+      costCents: parseMoneyCents(
+          value(['costprice', 'buyingcost', 'purchaseprice', 'unitcost'])),
       stock: int.tryParse(value(['initialstock', 'stock', 'quantity'])) ?? 0,
       reorderLevel: int.tryParse(
               value(['lowstockthreshold', 'threshold', 'reorderlevel'])) ??
@@ -10309,22 +16068,39 @@ class MetricCard extends StatelessWidget {
   final String value;
   final IconData icon;
   @override
-  Widget build(BuildContext context) => DecoratedPanel(
-        child: Row(children: [
-          Icon(icon, size: 30, color: Theme.of(context).colorScheme.primary),
-          const SizedBox(width: 14),
-          Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                Text(label),
-                const SizedBox(height: 4),
-                Text(value,
-                    style: const TextStyle(
-                        fontSize: 22, fontWeight: FontWeight.w900))
-              ])),
-        ]),
+  Widget build(BuildContext context) => Card(
+        elevation: 0,
+        margin: EdgeInsets.zero,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(8),
+            side: BorderSide(
+                color: Theme.of(context).colorScheme.outlineVariant)),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Row(children: [
+            Icon(icon, size: 24, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(width: 8),
+            Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                  Text(label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12)),
+                  const SizedBox(height: 2),
+                  FittedBox(
+                    alignment: Alignment.centerLeft,
+                    fit: BoxFit.scaleDown,
+                    child: Text(value,
+                        maxLines: 1,
+                        style: const TextStyle(
+                            fontSize: 19, fontWeight: FontWeight.w900)),
+                  )
+                ])),
+          ]),
+        ),
       );
 }
 
@@ -10475,6 +16251,36 @@ class TotalRow extends StatelessWidget {
           Expanded(child: Text(label, style: style)),
           Text(value, style: style)
         ]));
+  }
+}
+
+class CurrencyChoiceRow extends StatelessWidget {
+  const CurrencyChoiceRow(
+      {required this.label,
+      required this.selected,
+      required this.onSelected,
+      super.key});
+  final String label;
+  final String selected;
+  final ValueChanged<String> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(label, style: const TextStyle(fontWeight: FontWeight.w800)),
+      const SizedBox(height: 6),
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: ['USD', 'ZWL', 'ZAR', 'BWP']
+            .map((code) => ChoiceChip(
+                  label: Text(code),
+                  selected: selected == code,
+                  onSelected: (_) => onSelected(code),
+                ))
+            .toList(),
+      ),
+    ]);
   }
 }
 

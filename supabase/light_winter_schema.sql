@@ -74,13 +74,27 @@ create table if not exists public.lwr_products (
   id text primary key,
   organization_id text not null references public.lwr_organizations(id) on delete cascade,
   name text not null,
+  category text not null default '',
   sku text not null,
   barcode text not null default '',
   price_cents integer not null default 0,
+  cost_price_cents integer not null default 0,
   reorder_level integer not null default 5,
+  supplier_id text,
   active boolean not null default true,
   created_at timestamptz not null default now(),
   unique (organization_id, sku)
+);
+
+create table if not exists public.lwr_suppliers (
+  id text primary key,
+  organization_id text not null references public.lwr_organizations(id) on delete cascade,
+  name text not null,
+  phone text not null default '',
+  notes text not null default '',
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 create table if not exists public.lwr_branch_stock (
@@ -121,9 +135,25 @@ create table if not exists public.lwr_sale_lines (
   sale_id text not null references public.lwr_sales(id) on delete cascade,
   product_id text not null references public.lwr_products(id) on delete restrict,
   quantity integer not null,
+  product_name text not null default '',
   unit_price_cents integer not null,
-  line_total_cents integer not null
+  line_total_cents integer not null,
+  unit_cost_cents integer not null default 0,
+  line_cost_cents integer not null default 0
 );
+
+alter table public.lwr_products
+  add column if not exists cost_price_cents integer not null default 0;
+alter table public.lwr_products
+  add column if not exists category text not null default '';
+alter table public.lwr_products
+  add column if not exists supplier_id text;
+alter table public.lwr_sale_lines
+  add column if not exists unit_cost_cents integer not null default 0;
+alter table public.lwr_sale_lines
+  add column if not exists line_cost_cents integer not null default 0;
+alter table public.lwr_sale_lines
+  add column if not exists product_name text not null default '';
 
 create table if not exists public.lwr_sale_voids (
   id text primary key,
@@ -144,9 +174,19 @@ create table if not exists public.lwr_sale_void_lines (
   void_id text not null references public.lwr_sale_voids(id) on delete cascade,
   product_id text not null references public.lwr_products(id) on delete restrict,
   quantity integer not null check (quantity > 0),
+  product_name text not null default '',
   unit_price_cents integer not null default 0,
-  line_total_cents integer not null default 0
+  line_total_cents integer not null default 0,
+  unit_cost_cents integer not null default 0,
+  line_cost_cents integer not null default 0
 );
+
+alter table public.lwr_sale_void_lines
+  add column if not exists unit_cost_cents integer not null default 0;
+alter table public.lwr_sale_void_lines
+  add column if not exists line_cost_cents integer not null default 0;
+alter table public.lwr_sale_void_lines
+  add column if not exists product_name text not null default '';
 
 create table if not exists public.lwr_license_tokens (
   token text primary key,
@@ -214,6 +254,22 @@ create table if not exists public.lwr_stock_transfers (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.lwr_accounting_entries (
+  id text primary key,
+  organization_id text not null references public.lwr_organizations(id) on delete cascade,
+  branch_id text references public.lwr_branches(id) on delete set null,
+  device_uid text not null default '',
+  type text not null check (type in ('expense', 'income')) default 'expense',
+  category text not null default 'General',
+  description text not null default '',
+  amount_cents integer not null default 0,
+  payment_method text not null default '',
+  counterparty text not null default '',
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists public.lwr_fiscal_days (
   id text primary key,
   organization_id text not null references public.lwr_organizations(id) on delete cascade,
@@ -247,6 +303,7 @@ alter table public.lwr_devices enable row level security;
 alter table public.lwr_activation_codes enable row level security;
 alter table public.lwr_users enable row level security;
 alter table public.lwr_products enable row level security;
+alter table public.lwr_suppliers enable row level security;
 alter table public.lwr_branch_stock enable row level security;
 alter table public.lwr_customers enable row level security;
 alter table public.lwr_sales enable row level security;
@@ -259,6 +316,7 @@ alter table public.lwr_licenses enable row level security;
 alter table public.lwr_audit_events enable row level security;
 alter table public.lwr_exchange_rates enable row level security;
 alter table public.lwr_stock_transfers enable row level security;
+alter table public.lwr_accounting_entries enable row level security;
 alter table public.lwr_fiscal_days enable row level security;
 alter table public.lwr_fiscal_submissions enable row level security;
 
@@ -273,6 +331,7 @@ begin
     'lwr_activation_codes',
     'lwr_users',
     'lwr_products',
+    'lwr_suppliers',
     'lwr_branch_stock',
     'lwr_customers',
   'lwr_sales',
@@ -285,6 +344,7 @@ begin
     'lwr_audit_events',
     'lwr_exchange_rates',
     'lwr_stock_transfers',
+    'lwr_accounting_entries',
     'lwr_fiscal_days',
     'lwr_fiscal_submissions'
   ]
@@ -482,6 +542,7 @@ create index if not exists idx_lwr_sale_void_lines_void on public.lwr_sale_void_
 create index if not exists idx_lwr_stock_branch on public.lwr_branch_stock(branch_id);
 create index if not exists idx_lwr_exchange_rates_org on public.lwr_exchange_rates(organization_id);
 create index if not exists idx_lwr_stock_transfers_org on public.lwr_stock_transfers(organization_id, created_at desc);
+create index if not exists idx_lwr_accounting_entries_org_branch on public.lwr_accounting_entries(organization_id, branch_id, created_at desc);
 create index if not exists idx_lwr_fiscal_days_org_branch on public.lwr_fiscal_days(organization_id, branch_id, opened_at desc);
 create index if not exists idx_lwr_fiscal_submissions_org_status on public.lwr_fiscal_submissions(organization_id, status, created_at desc);
 create unique index if not exists idx_lwr_fiscal_days_one_open on public.lwr_fiscal_days(organization_id, branch_id) where status = 'open';
@@ -528,8 +589,6 @@ declare
   user_item jsonb;
   branch_id text;
   owner_id text := coalesce(nullif(p_owner->>'id', ''), ((extract(epoch from clock_timestamp()) * 1000000)::bigint + 2)::text);
-  bread_id text := ((extract(epoch from clock_timestamp()) * 1000000)::bigint + 3)::text;
-  mazoe_id text := ((extract(epoch from clock_timestamp()) * 1000000)::bigint + 4)::text;
 begin
   if trim(coalesce(p_shop_name, '')) = '' then
     raise exception 'Shop name is required.';
@@ -567,12 +626,6 @@ begin
     insert into public.lwr_users(id, organization_id, name, username, role, pin_plain, permissions, active)
     values (coalesce(nullif(user_item->>'id', ''), ((extract(epoch from clock_timestamp()) * 1000000)::bigint)::text), org_id, coalesce(nullif(user_item->>'name', ''), 'User'), coalesce(nullif(user_item->>'username', ''), lower(replace(coalesce(user_item->>'name', 'user'), ' ', '.'))), coalesce(nullif(user_item->>'role', ''), 'cashier'), coalesce(nullif(user_item->>'pin_plain', ''), '0000'), coalesce(user_item->'permissions', '[]'::jsonb), true);
   end loop;
-
-  insert into public.lwr_products(id, organization_id, name, sku, barcode, price_cents, reorder_level, active)
-  values (bread_id, org_id, 'Bread', 'BREAD', '1001', 110, 5, true), (mazoe_id, org_id, 'Mazoe Orange 2L', 'MAZOE-2L', '1002', 250, 4, true);
-
-  insert into public.lwr_branch_stock(branch_id, product_id, quantity)
-  values (main_branch_id, bread_id, 20), (main_branch_id, mazoe_id, 12);
 
   return jsonb_build_object('organization_id', org_id, 'branch_id', main_branch_id, 'device_uid', p_device_uid);
 end;

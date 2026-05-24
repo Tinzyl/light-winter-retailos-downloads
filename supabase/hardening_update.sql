@@ -421,8 +421,6 @@ declare
   user_item jsonb;
   branch_id text;
   owner_id text := coalesce(nullif(p_owner->>'id', ''), ((extract(epoch from clock_timestamp()) * 1000000)::bigint + 2)::text);
-  bread_id text := ((extract(epoch from clock_timestamp()) * 1000000)::bigint + 3)::text;
-  mazoe_id text := ((extract(epoch from clock_timestamp()) * 1000000)::bigint + 4)::text;
 begin
   if trim(coalesce(p_shop_name, '')) = '' then
     raise exception 'Shop name is required.';
@@ -505,16 +503,6 @@ begin
       true
     );
   end loop;
-
-  insert into public.lwr_products(id, organization_id, name, sku, barcode, price_cents, reorder_level, active)
-  values
-    (bread_id, org_id, 'Bread', 'BREAD', '1001', 110, 5, true),
-    (mazoe_id, org_id, 'Mazoe Orange 2L', 'MAZOE-2L', '1002', 250, 4, true);
-
-  insert into public.lwr_branch_stock(branch_id, product_id, quantity)
-  values
-    (main_branch_id, bread_id, 20),
-    (main_branch_id, mazoe_id, 12);
 
   return jsonb_build_object('organization_id', org_id, 'branch_id', main_branch_id, 'device_uid', p_device_uid);
 end;

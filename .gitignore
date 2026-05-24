@@ -31,6 +31,7 @@ Thumbs.db
 # Local generated state, logs, and private notes
 *.log
 *-state*.json
+*_state*.json
 android-phone-state*.json
 sunmi-*.json
 sunmi-cached-stock*.csv
