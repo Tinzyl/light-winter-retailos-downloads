@@ -212,7 +212,32 @@ class AppStore extends ChangeNotifier {
       formatLicenseCountdown(licenseExpiresAt, nowUtc: trustedNowUtc);
   bool get isBusy => _busyDepth > 0;
 
+  bool isCustomDatePeriod(String period) => period.startsWith('date:');
+
+  DateTime? customPeriodDate(String period) {
+    if (!isCustomDatePeriod(period)) return null;
+    return DateTime.tryParse(period.substring(5));
+  }
+
+  String customDatePeriod(DateTime date) =>
+      'date:${DateTime(date.year, date.month, date.day).toIso8601String().substring(0, 10)}';
+
+  String periodLabel(String period) {
+    final custom = customPeriodDate(period);
+    if (custom != null) return shortDate(custom);
+    return switch (period) {
+      'yearly' => 'Yearly',
+      'weekly' => 'Weekly',
+      'monthly' => 'Monthly',
+      _ => 'Daily',
+    };
+  }
+
   DateTime periodStart(String period) {
+    final custom = customPeriodDate(period);
+    if (custom != null) {
+      return DateTime(custom.year, custom.month, custom.day);
+    }
     final now = DateTime.now();
     return switch (period) {
       'yearly' => DateTime(now.year),
@@ -224,6 +249,11 @@ class AppStore extends ChangeNotifier {
   }
 
   bool saleIsInPeriod(SaleRecord sale, String period) {
+    final custom = customPeriodDate(period);
+    if (custom != null) {
+      return businessDate(sale.createdAt) ==
+          DateTime(custom.year, custom.month, custom.day);
+    }
     final saleDay = businessDate(sale.createdAt);
     final today = businessDate(DateTime.now());
     final weekStart = today.subtract(Duration(days: today.weekday - 1));
@@ -314,12 +344,15 @@ class AppStore extends ChangeNotifier {
   }
 
   ReportSnapshot reportSnapshot(String period, {required bool allBranches}) {
-    final title = switch (period) {
-      'yearly' => 'Yearly Report',
-      'weekly' => 'Weekly Report',
-      'monthly' => 'Monthly Report',
-      _ => 'Daily Report',
-    };
+    final custom = customPeriodDate(period);
+    final title = custom != null
+        ? 'Report for ${shortDate(custom)}'
+        : switch (period) {
+            'yearly' => 'Yearly Report',
+            'weekly' => 'Weekly Report',
+            'monthly' => 'Monthly Report',
+            _ => 'Daily Report',
+          };
     final source = allBranches ? allKnownSales : sales;
     final scoped = source
         .where((sale) =>
@@ -908,17 +941,38 @@ Each device still needs its own Light Winter Technologies license voucher after 
   bool get catalogueWideViewEnabled =>
       canUseCentralCatalogueMode && allCatalogueProductsVisible;
 
-  String exportCurrentStockCsv() {
+  List<Product> stockExportProducts(String filter) {
+    final productsForExport = branchScopedProducts.where((product) {
+      if (product.isCustom) return false;
+      final quantity = stockViewQuantityFor(product);
+      return switch (filter) {
+        'low' => quantity > 0 && quantity <= product.reorderLevel,
+        'out' => quantity <= 0,
+        _ => true,
+      };
+    }).toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return productsForExport;
+  }
+
+  String stockFilterLabel(String filter) => switch (filter) {
+        'low' => 'Low stock',
+        'out' => 'Out of stock',
+        _ => 'All products',
+      };
+
+  String exportCurrentStockCsv({String filter = 'all'}) {
     final branchName = currentBranch?.name ?? 'Unassigned branch';
     final scope = catalogueWideViewEnabled ? 'All branches' : 'Current branch';
     final rows = <List<String>>[
       [
         'Product Name',
-        'Category',
-        'SKU',
+        'Product Category',
+        'SKU number',
+        'Barcode',
         'Cost Price',
         'Selling Price',
-        'Current Stock',
+        'Initial Stock',
         'Low Stock Threshold',
         'Supplier',
         'Supplier Phone',
@@ -926,10 +980,7 @@ Each device still needs its own Light Winter Technologies license voucher after 
         'Scope'
       ]
     ];
-    final exportProducts = branchScopedProducts
-        .where((item) => !item.isCustom)
-        .toList()
-      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    final exportProducts = stockExportProducts(filter);
     for (final product in exportProducts) {
       final supplier =
           suppliers.where((item) => item.id == product.supplierId).firstOrNull;
@@ -937,8 +988,9 @@ Each device still needs its own Light Winter Technologies license voucher after 
         product.name,
         product.category,
         product.sku,
-        moneyFor(product.costCents),
-        moneyFor(product.priceCents),
+        product.barcode,
+        (product.costCents / 100).toStringAsFixed(2),
+        (product.priceCents / 100).toStringAsFixed(2),
         '${stockViewQuantityFor(product)}',
         '${product.reorderLevel}',
         supplier?.name ?? '',
@@ -948,6 +1000,56 @@ Each device still needs its own Light Winter Technologies license voucher after 
       ]);
     }
     return rows.map(csvLine).join('\r\n');
+  }
+
+  String stockReportText({String filter = 'all'}) {
+    final branchName = currentBranch?.name ?? 'Unassigned branch';
+    final scope = catalogueWideViewEnabled ? 'All branches' : 'Current branch';
+    final exportProducts = stockExportProducts(filter);
+    final totalPieces = exportProducts.fold<int>(
+        0, (sum, product) => sum + max(0, stockViewQuantityFor(product)));
+    final stockValue = exportProducts.fold<int>(
+        0,
+        (sum, product) =>
+            sum + max(0, stockViewQuantityFor(product)) * product.priceCents);
+    final costValue = exportProducts.fold<int>(
+        0,
+        (sum, product) =>
+            sum + max(0, stockViewQuantityFor(product)) * product.costCents);
+    final buffer = StringBuffer()
+      ..writeln('Light Winter Technologies')
+      ..writeln('${stockFilterLabel(filter)} Stock Report')
+      ..writeln('Shop: ${company?.shopName ?? ''}')
+      ..writeln('Branch: $branchName')
+      ..writeln('Scope: $scope')
+      ..writeln('Generated: ${DateTime.now().toLocal()}')
+      ..writeln('Products: ${exportProducts.length}')
+      ..writeln('Total quantity: $totalPieces')
+      ..writeln('Stock value at selling price: ${moneyFor(stockValue)}')
+      ..writeln('Stock cost value: ${moneyFor(costValue)}')
+      ..writeln()
+      ..writeln('Stock Product List');
+    for (final product in exportProducts) {
+      final quantity = stockViewQuantityFor(product);
+      final supplier =
+          suppliers.where((item) => item.id == product.supplierId).firstOrNull;
+      buffer
+        ..writeln(
+            '${product.name} | Qty: $quantity | Price: ${moneyFor(product.priceCents)}')
+        ..writeln(
+            '  Category: ${product.category.isEmpty ? '-' : product.category}')
+        ..writeln('  SKU: ${product.sku.isEmpty ? '-' : product.sku}')
+        ..writeln(
+            '  Barcode: ${product.barcode.isEmpty ? '-' : product.barcode}')
+        ..writeln(
+            '  Cost: ${moneyFor(product.costCents)} | Threshold: ${product.reorderLevel}')
+        ..writeln('  Supplier: ${supplier?.name ?? '-'}')
+        ..writeln();
+    }
+    if (exportProducts.isEmpty) {
+      buffer.writeln('No products found for this stock report.');
+    }
+    return buffer.toString().trim();
   }
 
   String moneyFor(int cents, {String? currency}) {
@@ -1085,6 +1187,11 @@ Each device still needs its own Light Winter Technologies license voucher after 
   }
 
   bool entryIsInPeriod(AccountingEntry entry, String period) {
+    final custom = customPeriodDate(period);
+    if (custom != null) {
+      return businessDate(entry.createdAt) ==
+          DateTime(custom.year, custom.month, custom.day);
+    }
     final entryDay = businessDate(entry.createdAt);
     final today = businessDate(DateTime.now());
     final weekStart = today.subtract(Duration(days: today.weekday - 1));
@@ -2291,6 +2398,8 @@ Each device still needs its own Light Winter Technologies license voucher after 
     }
     final result = await ApiClient(backendUrl)
         .resetOwnerAccess(recoveryCode, deviceUid, resetVoucher, newPin);
+    final data = await ApiClient(backendUrl).bootstrap(deviceUid);
+    _applyBootstrap(data);
     syncStatus = 'Owner access reset completed.';
     await save();
     notifyListeners();
@@ -5213,12 +5322,17 @@ class ProfitLossStatement {
   final Map<String, int> expensesByCategory;
   final Map<String, int> incomeByCategory;
 
-  String get title => switch (period) {
-        'yearly' => 'Yearly',
-        'weekly' => 'Weekly',
-        'monthly' => 'Monthly',
-        _ => 'Daily',
-      };
+  String get title {
+    if (period.startsWith('date:')) {
+      return period.substring(5);
+    }
+    return switch (period) {
+      'yearly' => 'Yearly',
+      'weekly' => 'Weekly',
+      'monthly' => 'Monthly',
+      _ => 'Daily',
+    };
+  }
 }
 
 class BatchExpiryRecord {
@@ -9037,6 +9151,7 @@ class _DashboardPageState extends State<DashboardPage> {
   Widget build(BuildContext context) {
     final store = widget.store;
     final report = store.reportSnapshot(period, allBranches: allBranches);
+    final filePeriod = period.replaceAll(':', '-');
     return PageFrame(
       title: 'Reports and Backup',
       children: [
@@ -9072,12 +9187,37 @@ class _DashboardPageState extends State<DashboardPage> {
                       value: 'yearly',
                       icon: Icon(Icons.event_note),
                       label: Text('Yearly')),
+                  ButtonSegment(
+                      value: 'date',
+                      icon: Icon(Icons.event),
+                      label: Text('Date')),
                 ],
-                selected: {period},
-                onSelectionChanged: (value) =>
-                    setState(() => period = value.first),
+                selected: {period.startsWith('date:') ? 'date' : period},
+                onSelectionChanged: (value) async {
+                  final selected = value.first;
+                  if (selected == 'date') {
+                    final picked = await showDatePicker(
+                        context: context,
+                        initialDate:
+                            store.customPeriodDate(period) ?? DateTime.now(),
+                        firstDate: DateTime(2020),
+                        lastDate:
+                            DateTime.now().add(const Duration(days: 365)));
+                    if (picked != null && mounted) {
+                      setState(() => period = store.customDatePeriod(picked));
+                    }
+                  } else {
+                    setState(() => period = selected);
+                  }
+                },
               ),
             ),
+            if (period.startsWith('date:')) ...[
+              const SizedBox(height: 8),
+              Chip(
+                  avatar: const Icon(Icons.event, size: 18),
+                  label: Text('Selected date: ${store.periodLabel(period)}')),
+            ],
             const SizedBox(height: 10),
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
@@ -9101,7 +9241,7 @@ class _DashboardPageState extends State<DashboardPage> {
                   onPressed: () async {
                     await ReceiptOutputService.sharePdf(
                         store.reportText(report, allBranches: allBranches),
-                        filename: 'light-winter-${period}-report.pdf',
+                        filename: 'light-winter-$filePeriod-report.pdf',
                         brandedReport: true);
                     if (context.mounted)
                       showMessage(context, 'Report PDF ready to share');
@@ -9209,6 +9349,7 @@ class _ProfitLossPageState extends State<ProfitLossPage> {
     final store = widget.store;
     final statement =
         store.profitLossStatement(period, allBranches: allBranches);
+    final filePeriod = period.replaceAll(':', '-');
     return PageFrame(
       title: 'Profit and Loss',
       children: [
@@ -9238,12 +9379,37 @@ class _ProfitLossPageState extends State<ProfitLossPage> {
                       value: 'yearly',
                       icon: Icon(Icons.event_note),
                       label: Text('Yearly')),
+                  ButtonSegment(
+                      value: 'date',
+                      icon: Icon(Icons.event),
+                      label: Text('Date')),
                 ],
-                selected: {period},
-                onSelectionChanged: (value) =>
-                    setState(() => period = value.first),
+                selected: {period.startsWith('date:') ? 'date' : period},
+                onSelectionChanged: (value) async {
+                  final selected = value.first;
+                  if (selected == 'date') {
+                    final picked = await showDatePicker(
+                        context: context,
+                        initialDate:
+                            store.customPeriodDate(period) ?? DateTime.now(),
+                        firstDate: DateTime(2020),
+                        lastDate:
+                            DateTime.now().add(const Duration(days: 365)));
+                    if (picked != null && mounted) {
+                      setState(() => period = store.customDatePeriod(picked));
+                    }
+                  } else {
+                    setState(() => period = selected);
+                  }
+                },
               ),
             ),
+            if (period.startsWith('date:')) ...[
+              const SizedBox(height: 8),
+              Chip(
+                  avatar: const Icon(Icons.event, size: 18),
+                  label: Text('Selected date: ${store.periodLabel(period)}')),
+            ],
             const SizedBox(height: 10),
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
@@ -9311,7 +9477,7 @@ class _ProfitLossPageState extends State<ProfitLossPage> {
                     await ReceiptOutputService.sharePdf(
                         store.profitLossText(statement,
                             allBranches: allBranches),
-                        filename: 'light-winter-profit-loss-$period.pdf',
+                        filename: 'light-winter-profit-loss-$filePeriod.pdf',
                         brandedReport: true);
                   },
                   icon: const Icon(Icons.picture_as_pdf),
@@ -10408,6 +10574,37 @@ class PosPage extends StatefulWidget {
 
 class _PosPageState extends State<PosPage> {
   String query = '';
+  final searchController = TextEditingController();
+
+  @override
+  void dispose() {
+    searchController.dispose();
+    super.dispose();
+  }
+
+  String _scanKey(String value) =>
+      value.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+
+  void _autoAddScannedCode(String value, List<Product> searchScope) {
+    final clean = _scanKey(value);
+    if (clean.isEmpty) return;
+    final store = widget.store;
+    final exactMatches = searchScope.where((product) {
+      final available =
+          product.isCustom ? 999999 : store.sellableQuantityFor(product);
+      if (available <= 0) return false;
+      return _scanKey(product.barcode) == clean ||
+          _scanKey(product.sku) == clean;
+    }).toList();
+    if (exactMatches.length == 1) {
+      store.addToCart(exactMatches.first);
+      SystemSound.play(SystemSoundType.click);
+      setState(() => query = '');
+      searchController.clear();
+    } else if (exactMatches.length > 1) {
+      showMessage(context, 'Multiple items use this barcode/SKU.');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -10435,11 +10632,27 @@ class _PosPageState extends State<PosPage> {
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
           const SizedBox(height: 8),
           TextField(
+            controller: searchController,
             onChanged: (value) => setState(() => query = value),
+            onSubmitted: (value) => _autoAddScannedCode(value, searchScope),
             decoration: const InputDecoration(
                 prefixIcon: Icon(Icons.search),
                 labelText: 'Search product or SKU',
                 border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: () async {
+              final value = await showManualTextPad(context,
+                  title: 'Type Product / SKU / Barcode',
+                  initialValue: query,
+                  allowLetters: true);
+              if (value == null) return;
+              setState(() => query = value);
+              searchController.text = value;
+            },
+            icon: const Icon(Icons.keyboard),
+            label: const Text('Type Manually'),
           ),
           const SizedBox(height: 12),
           Text(
@@ -13162,6 +13375,7 @@ class ReceiptOutputService {
       'Debt Aging',
       'Expense / Income Register',
       'Accounting Entries',
+      'Stock Product List',
     }.contains(line.trim());
   }
 
@@ -13468,41 +13682,82 @@ Future<void> showWhatsAppReceiptDialog(
 }
 
 Future<void> showStockExportDialog(BuildContext context, AppStore store) async {
-  final csvText = store.exportCurrentStockCsv();
-  final filename = 'light-winter-stock-${localDateKey(DateTime.now())}.csv';
   final phone = TextEditingController();
   File? savedFile;
   bool busy = false;
+  String filter = 'all';
+  bool pdfMode = true;
   await showDialog(
     context: context,
     builder: (context) => StatefulBuilder(
       builder: (context, setState) => AlertDialog(
-        title: const Text('Export Stock Only'),
+        title: const Text('Export Stock'),
         content: SingleChildScrollView(
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             InfoPanel(
                 icon: Icons.ios_share,
-                title: store.catalogueWideViewEnabled
-                    ? 'All branches stock'
-                    : 'Current branch stock',
+                title:
+                    '${store.stockFilterLabel(filter)} - ${store.catalogueWideViewEnabled ? 'All branches' : 'Current branch'}',
                 body:
-                    'Exports only products and stock details, matching the stock import format. It does not export sales, transactions, users, debts, reports, or backups.'),
+                    'Exports product stock only: product name, category, SKU, barcode, cost, selling price, quantity, threshold, supplier, branch, and scope.'),
+            const SizedBox(height: 10),
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(
+                    value: 'all',
+                    icon: Icon(Icons.inventory_2),
+                    label: Text('All')),
+                ButtonSegment(
+                    value: 'low',
+                    icon: Icon(Icons.warning),
+                    label: Text('Low')),
+                ButtonSegment(
+                    value: 'out',
+                    icon: Icon(Icons.remove_shopping_cart),
+                    label: Text('Out')),
+              ],
+              selected: {filter},
+              onSelectionChanged:
+                  busy ? null : (value) => setState(() => filter = value.first),
+            ),
+            const SizedBox(height: 10),
+            SegmentedButton<bool>(
+              segments: const [
+                ButtonSegment(
+                    value: true,
+                    icon: Icon(Icons.picture_as_pdf),
+                    label: Text('PDF')),
+                ButtonSegment(
+                    value: false,
+                    icon: Icon(Icons.table_chart),
+                    label: Text('CSV')),
+              ],
+              selected: {pdfMode},
+              onSelectionChanged: busy
+                  ? null
+                  : (value) => setState(() => pdfMode = value.first),
+            ),
             if (savedFile != null) ...[
               const SizedBox(height: 10),
               SelectableText(savedFile!.path,
                   style: Theme.of(context).textTheme.bodySmall),
             ],
             const SizedBox(height: 12),
-            TextFormField(
-              controller: phone,
-              enabled: !busy,
-              keyboardType: TextInputType.phone,
-              decoration: const InputDecoration(
-                prefixIcon: Icon(Icons.phone),
-                labelText: 'WhatsApp number, e.g. +263771234567',
-                border: OutlineInputBorder(),
+            if (pdfMode)
+              const WarningPanel(
+                  text:
+                      'PDF opens the Android share screen. Choose WhatsApp there to send the actual PDF file.')
+            else
+              TextFormField(
+                controller: phone,
+                enabled: !busy,
+                keyboardType: TextInputType.phone,
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.phone),
+                  labelText: 'WhatsApp number, e.g. +263771234567',
+                  border: OutlineInputBorder(),
+                ),
               ),
-            ),
           ]),
         ),
         actions: [
@@ -13515,12 +13770,27 @@ Future<void> showStockExportDialog(BuildContext context, AppStore store) async {
                   : () async {
                       setState(() => busy = true);
                       try {
-                        savedFile = await ReceiptOutputService.saveCsv(csvText,
-                            filename: filename);
+                        if (pdfMode) {
+                          final bytes = await ReceiptOutputService.buildPdf(
+                              store.stockReportText(filter: filter),
+                              brandedReport: true);
+                          final dir = await getApplicationDocumentsDirectory();
+                          final filename =
+                              'light-winter-${filter}-stock-${localDateKey(DateTime.now())}.pdf';
+                          savedFile = File(
+                              '${dir.path}${Platform.pathSeparator}$filename');
+                          await savedFile!.writeAsBytes(bytes);
+                        } else {
+                          savedFile = await ReceiptOutputService.saveCsv(
+                              store.exportCurrentStockCsv(filter: filter),
+                              filename:
+                                  'light-winter-${filter}-stock-${localDateKey(DateTime.now())}.csv');
+                        }
                         await Clipboard.setData(
                             ClipboardData(text: savedFile!.path));
                         if (context.mounted) {
-                          showMessage(context, 'CSV saved. File path copied.');
+                          showMessage(context,
+                              '${pdfMode ? 'PDF' : 'CSV'} saved. File path copied.');
                         }
                       } catch (error) {
                         if (context.mounted) {
@@ -13538,11 +13808,20 @@ Future<void> showStockExportDialog(BuildContext context, AppStore store) async {
                   : () async {
                       setState(() => busy = true);
                       try {
-                        final uri = Uri.parse(
-                            'mailto:?subject=${Uri.encodeComponent('Light Winter Stock CSV')}&body=${Uri.encodeComponent(csvText)}');
-                        final opened = await launchUrl(uri,
-                            mode: LaunchMode.externalApplication);
-                        if (!opened) throw StateError('Email app not opened.');
+                        if (pdfMode) {
+                          await ReceiptOutputService.sharePdf(
+                              store.stockReportText(filter: filter),
+                              filename:
+                                  'light-winter-${filter}-stock-report.pdf',
+                              brandedReport: true);
+                        } else {
+                          final uri = Uri.parse(
+                              'mailto:?subject=${Uri.encodeComponent('Light Winter ${store.stockFilterLabel(filter)} Stock CSV')}&body=${Uri.encodeComponent(store.exportCurrentStockCsv(filter: filter))}');
+                          final opened = await launchUrl(uri,
+                              mode: LaunchMode.externalApplication);
+                          if (!opened)
+                            throw StateError('Email app not opened.');
+                        }
                       } catch (error) {
                         if (context.mounted) {
                           showMessage(context, cleanError(error));
@@ -13552,15 +13831,23 @@ Future<void> showStockExportDialog(BuildContext context, AppStore store) async {
                       }
                     },
               icon: const Icon(Icons.email),
-              label: const Text('Email')),
+              label: Text(pdfMode ? 'Share PDF' : 'Email CSV')),
           FilledButton.icon(
               onPressed: busy
                   ? null
                   : () async {
                       setState(() => busy = true);
                       try {
-                        await ReceiptOutputService.sendWhatsApp(
-                            phone.text, csvText);
+                        if (pdfMode) {
+                          await ReceiptOutputService.sharePdf(
+                              store.stockReportText(filter: filter),
+                              filename:
+                                  'light-winter-${filter}-stock-report.pdf',
+                              brandedReport: true);
+                        } else {
+                          await ReceiptOutputService.sendWhatsApp(phone.text,
+                              store.exportCurrentStockCsv(filter: filter));
+                        }
                       } catch (error) {
                         if (context.mounted) {
                           showMessage(context, cleanError(error));
@@ -13575,7 +13862,7 @@ Future<void> showStockExportDialog(BuildContext context, AppStore store) async {
                       height: 18,
                       child: CircularProgressIndicator(strokeWidth: 2))
                   : const Icon(Icons.chat),
-              label: const Text('WhatsApp')),
+              label: Text(pdfMode ? 'Share PDF / WhatsApp' : 'WhatsApp CSV')),
         ],
       ),
     ),
@@ -13879,13 +14166,33 @@ Future<void> showStockPurchaseDialog(
 Future<void> showSupplierPaymentDialog(
     BuildContext context, AppStore store) async {
   final supplier = TextEditingController();
-  final amount = TextEditingController();
+  final invoiceTotal = TextEditingController();
+  final paidNow = TextEditingController();
+  final note = TextEditingController();
   String paymentMethod = 'Cash';
+  bool busy = false;
+  int supplierBalance() {
+    final clean = supplier.text.trim().toLowerCase();
+    if (clean.isEmpty) return 0;
+    final balances = store.supplierBalanceMap(store.accountingEntries);
+    for (final entry in balances.entries) {
+      if (entry.key.trim().toLowerCase() == clean) return entry.value;
+    }
+    return 0;
+  }
+
+  int projectedBalance() {
+    final current = supplierBalance();
+    final newBill = store.displayAmountToBaseCents(invoiceTotal.text);
+    final payment = store.displayAmountToBaseCents(paidNow.text);
+    return current + max<int>(0, newBill) - max<int>(0, payment);
+  }
+
   await showDialog(
     context: context,
     builder: (context) => StatefulBuilder(
       builder: (context, setState) => AlertDialog(
-        title: const Text('Pay Supplier'),
+        title: const Text('Supplier Payment / Owing'),
         content: SingleChildScrollView(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 420),
@@ -13894,13 +14201,47 @@ Future<void> showSupplierPaymentDialog(
                   controller: supplier,
                   label: 'Supplier name',
                   icon: Icons.local_shipping,
-                  required: true),
-              Field(
-                  controller: amount,
-                  label: 'Amount paid in ${store.displayCurrency}',
-                  icon: Icons.payments,
                   required: true,
-                  keyboardType: TextInputType.number),
+                  onChanged: (_) => setState(() {})),
+              Field(
+                  controller: invoiceTotal,
+                  label: 'New bill / goods in ${store.displayCurrency}',
+                  icon: Icons.receipt_long,
+                  keyboardType: TextInputType.number,
+                  onChanged: (_) => setState(() {})),
+              Field(
+                  controller: paidNow,
+                  label: 'Paid now in ${store.displayCurrency}',
+                  icon: Icons.payments,
+                  keyboardType: TextInputType.number,
+                  onChanged: (_) => setState(() {})),
+              Field(
+                  controller: note,
+                  label: 'Note / invoice number',
+                  icon: Icons.note_alt),
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                    color: const Color(0xFFE8F3F0),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFFB7D7D1))),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                          'Current owing: ${store.moneyFor(supplierBalance())}',
+                          style: const TextStyle(fontWeight: FontWeight.w800)),
+                      Text(
+                          'After saving: ${store.moneyFor(projectedBalance())}',
+                          style: const TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 4),
+                      const Text(
+                          'Leave the new bill blank when only paying old supplier owing.',
+                          style: TextStyle(fontSize: 12)),
+                    ]),
+              ),
               DropdownButtonFormField<String>(
                 value: paymentMethod,
                 decoration: const InputDecoration(
@@ -13926,25 +14267,74 @@ Future<void> showSupplierPaymentDialog(
               onPressed: () => Navigator.pop(context),
               child: const Text('Cancel')),
           FilledButton(
-              onPressed: () async {
-                final cents = store.displayAmountToBaseCents(amount.text);
-                if (supplier.text.trim().isEmpty || cents <= 0) {
-                  showMessage(context, 'Enter supplier name and valid amount.');
-                  return;
-                }
-                await store.addAccountingEntry(AccountingEntry(
-                    id: newId(),
-                    branchId: store.assignedBranchId ?? '',
-                    type: AccountingEntryType.expense,
-                    category: 'Supplier Payment',
-                    description: 'Supplier payment',
-                    amountCents: cents,
-                    paymentMethod: paymentMethod,
-                    counterparty: supplier.text.trim(),
-                    createdAt: DateTime.now()));
-                if (context.mounted) Navigator.pop(context);
-              },
-              child: const Text('Save Payment')),
+              onPressed: busy
+                  ? null
+                  : () async {
+                      final billCents =
+                          store.displayAmountToBaseCents(invoiceTotal.text);
+                      final paidCents =
+                          store.displayAmountToBaseCents(paidNow.text);
+                      final cleanSupplier = supplier.text.trim();
+                      final cleanNote = note.text.trim();
+                      if (cleanSupplier.isEmpty ||
+                          (billCents <= 0 && paidCents <= 0)) {
+                        showMessage(context,
+                            'Enter supplier name, bill amount, or payment amount.');
+                        return;
+                      }
+                      if (billCents > 0 && paidCents > billCents) {
+                        showMessage(context,
+                            'Paid now cannot be more than the new bill. To pay old owing, leave the new bill blank.');
+                        return;
+                      }
+                      setState(() => busy = true);
+                      try {
+                        final now = DateTime.now();
+                        if (billCents > 0) {
+                          await store.addAccountingEntry(AccountingEntry(
+                              id: newId(),
+                              branchId: store.assignedBranchId ?? '',
+                              type: AccountingEntryType.expense,
+                              category: 'Stock Purchase',
+                              description: cleanNote.isEmpty
+                                  ? 'Supplier bill / goods received'
+                                  : 'Supplier bill / goods received - $cleanNote',
+                              amountCents: billCents,
+                              paymentMethod: paidCents >= billCents
+                                  ? paymentMethod
+                                  : 'Supplier debt',
+                              counterparty: cleanSupplier,
+                              createdAt: now));
+                        }
+                        if (paidCents > 0) {
+                          await store.addAccountingEntry(AccountingEntry(
+                              id: newId(),
+                              branchId: store.assignedBranchId ?? '',
+                              type: AccountingEntryType.expense,
+                              category: 'Supplier Payment',
+                              description: cleanNote.isEmpty
+                                  ? 'Supplier payment'
+                                  : 'Supplier payment - $cleanNote',
+                              amountCents: paidCents,
+                              paymentMethod: paymentMethod,
+                              counterparty: cleanSupplier,
+                              createdAt:
+                                  now.add(const Duration(milliseconds: 1))));
+                        }
+                        if (context.mounted) Navigator.pop(context);
+                      } catch (error) {
+                        if (context.mounted)
+                          showMessage(context, cleanError(error));
+                      } finally {
+                        if (context.mounted) setState(() => busy = false);
+                      }
+                    },
+              child: busy
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Text('Save Supplier Record')),
         ],
       ),
     ),
@@ -14913,6 +15303,21 @@ Future<void> showProductDialog(BuildContext context, AppStore store,
                 ),
               Field(controller: sku, label: 'SKU', icon: Icons.tag),
               Field(controller: barcode, label: 'Barcode', icon: Icons.qr_code),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: OutlinedButton.icon(
+                  onPressed: () async {
+                    final value = await showManualTextPad(context,
+                        title: 'Type Barcode',
+                        initialValue: barcode.text,
+                        allowLetters: true);
+                    if (value != null) barcode.text = value;
+                  },
+                  icon: const Icon(Icons.keyboard),
+                  label: const Text('Type Barcode Manually'),
+                ),
+              ),
+              const SizedBox(height: 10),
               Field(
                   controller: cost,
                   label: 'Buying cost in USD',
@@ -15891,6 +16296,88 @@ Future<UserDraft?> showUserEditorDialog(BuildContext context,
   );
 }
 
+Future<String?> showManualTextPad(BuildContext context,
+    {required String title,
+    String initialValue = '',
+    bool allowLetters = true}) async {
+  var value = initialValue.trim();
+  final keys = [
+    ...'1234567890'.split(''),
+    if (allowLetters) ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split(''),
+    '-',
+    '.',
+    '/',
+  ];
+  return showDialog<String>(
+    context: context,
+    builder: (context) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: Text(title),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 430),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+              decoration: BoxDecoration(
+                border: Border.all(
+                    color: Theme.of(context).colorScheme.outlineVariant),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                value.isEmpty ? 'Type here' : value,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style:
+                    const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final key in keys)
+                  SizedBox(
+                    width: 48,
+                    height: 44,
+                    child: OutlinedButton(
+                      onPressed: () => setState(() => value += key),
+                      style: OutlinedButton.styleFrom(
+                          padding: EdgeInsets.zero,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8))),
+                      child: Text(key,
+                          style: const TextStyle(fontWeight: FontWeight.w900)),
+                    ),
+                  ),
+              ],
+            ),
+          ]),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: value.isEmpty
+                  ? null
+                  : () => setState(() =>
+                      value = value.substring(0, max(0, value.length - 1))),
+              child: const Text('Backspace')),
+          TextButton(
+              onPressed:
+                  value.isEmpty ? null : () => setState(() => value = ''),
+              child: const Text('Clear')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, value.trim()),
+              child: const Text('OK')),
+        ],
+      ),
+    ),
+  );
+}
+
 void showMessage(BuildContext context, String text) {
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
 }
@@ -16031,6 +16518,7 @@ class Field extends StatelessWidget {
       this.required = false,
       this.obscure = false,
       this.keyboardType,
+      this.onChanged,
       super.key});
   final TextEditingController controller;
   final String label;
@@ -16038,6 +16526,7 @@ class Field extends StatelessWidget {
   final bool required;
   final bool obscure;
   final TextInputType? keyboardType;
+  final ValueChanged<String>? onChanged;
   @override
   Widget build(BuildContext context) {
     return Padding(
@@ -16046,6 +16535,7 @@ class Field extends StatelessWidget {
         controller: controller,
         obscureText: obscure,
         keyboardType: keyboardType,
+        onChanged: onChanged,
         validator: required
             ? (value) => (value ?? '').trim().isEmpty ? 'Required' : null
             : null,
